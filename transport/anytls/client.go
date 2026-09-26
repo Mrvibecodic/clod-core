@@ -98,6 +98,10 @@ func (c *Client) createOutboundTLSConnection(ctx context.Context) (net.Conn, err
 	return tlsConn, nil
 }
 
+func (h *Client) ResetNetwork() {
+	h.sessionClient.ResetSessions()
+}
+
 func (h *Client) Close() error {
 	return h.sessionClient.Close()
 }

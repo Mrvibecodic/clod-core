@@ -86,6 +86,12 @@ func (t *AnyTLS) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (t *AnyTLS) ResetNetwork() {
+	if t.client != nil {
+		t.client.ResetNetwork()
+	}
+}
+
 // Close implements C.ProxyAdapter
 func (t *AnyTLS) Close() error {
 	return t.client.Close()

@@ -70,6 +70,12 @@ type TuicOption struct {
 }
 
 // DialContext implements C.ProxyAdapter
+func (t *Tuic) ResetNetwork() {
+	if t.client != nil {
+		t.client.ResetNetwork()
+	}
+}
+
 func (t *Tuic) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	conn, err := t.client.DialContext(ctx, metadata)
 	if err != nil {

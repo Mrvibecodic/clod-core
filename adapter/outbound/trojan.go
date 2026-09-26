@@ -269,6 +269,12 @@ func (t *Trojan) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (t *Trojan) ResetNetwork() {
+	if t.gunClient != nil {
+		_ = t.gunClient.Close()
+	}
+}
+
 // Close implements C.ProxyAdapter
 func (t *Trojan) Close() error {
 	var errs []error

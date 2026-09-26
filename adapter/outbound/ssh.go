@@ -102,6 +102,15 @@ func (s *Ssh) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (s *Ssh) ResetNetwork() {
+	s.cMutex.Lock()
+	defer s.cMutex.Unlock()
+	if s.client != nil {
+		_ = s.client.Close()
+		s.client = nil
+	}
+}
+
 // Close implements C.ProxyAdapter
 func (s *Ssh) Close() error {
 	s.cMutex.Lock()

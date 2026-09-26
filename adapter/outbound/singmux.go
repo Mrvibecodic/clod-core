@@ -83,6 +83,15 @@ func (s *SingMux) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (s *SingMux) ResetNetwork() {
+	if s.client != nil {
+		s.client.Reset()
+	}
+	if r, ok := s.ProxyAdapter.(interface{ ResetNetwork() }); ok {
+		r.ResetNetwork()
+	}
+}
+
 // Close implements C.ProxyAdapter
 func (s *SingMux) Close() error {
 	if s.client != nil {

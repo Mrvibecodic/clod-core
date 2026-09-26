@@ -415,6 +415,12 @@ func (v *Vless) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (v *Vless) ResetNetwork() {
+	if v.gunClient != nil {
+		_ = v.gunClient.Close()
+	}
+}
+
 // Close implements C.ProxyAdapter
 func (v *Vless) Close() error {
 	var errs []error

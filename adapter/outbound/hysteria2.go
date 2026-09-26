@@ -111,6 +111,12 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	return NewPacketConn(N.NewThreadSafePacketConn(pc), h), nil
 }
 
+func (h *Hysteria2) ResetNetwork() {
+	if h.client != nil {
+		_ = h.client.CloseWithError(errors.New("network changed"))
+	}
+}
+
 // Close implements C.ProxyAdapter
 func (h *Hysteria2) Close() error {
 	if h.client != nil {

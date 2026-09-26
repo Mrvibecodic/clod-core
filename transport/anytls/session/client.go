@@ -150,6 +150,29 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	return session, nil
 }
 
+func (c *Client) ResetSessions() {
+	c.idleSessionLock.Lock()
+	it := c.idleSession.Iterate()
+	for it.IsNotEnd() {
+		key := it.Key()
+		it.MoveToNext()
+		c.idleSession.Remove(key)
+	}
+	c.idleSessionLock.Unlock()
+
+	c.sessionsLock.Lock()
+	sessionToClose := make([]*Session, 0, len(c.sessions))
+	for _, session := range c.sessions {
+		sessionToClose = append(sessionToClose, session)
+	}
+	c.sessions = make(map[uint64]*Session)
+	c.sessionsLock.Unlock()
+
+	for _, session := range sessionToClose {
+		session.Close()
+	}
+}
+
 func (c *Client) Close() error {
 	c.dieCancel()
 
