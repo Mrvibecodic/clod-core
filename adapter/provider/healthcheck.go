@@ -262,10 +262,23 @@ func (r *probeRun) finished() bool {
 	}
 }
 
+// startProbe waits for the probe's start slot (probes to one host are spaced
+// out) and then runs the probe in the background: the hedge timer of the
+// caller counts from the probe's own start, not from the wait for the slot.
 func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) *probeRun {
 	ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+	run := &probeRun{result: &C.ProbeResult{}, done: make(chan struct{}), cancel: cancel}
+	if err := C.ProbePace(ctx, C.ProbeHost(p.Addr())); err != nil {
+		// The check was cancelled while the probe waited for its turn:
+		// nothing ran, the result stays unheld.
+		run.started = time.Now()
+		close(run.done)
+		return run
+	}
+	ctx = C.MarkProbePaced(ctx)
 	ctx, held := C.WithHeldProbe(ctx)
-	run := &probeRun{started: time.Now(), result: held, done: make(chan struct{}), cancel: cancel}
+	run.started = time.Now()
+	run.result = held
 	go func() {
 		defer close(run.done)
 		_, _ = p.URLTest(ctx, url, expectedStatus)

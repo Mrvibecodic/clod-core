@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -225,5 +226,63 @@ func TestANodeInTwoGroupsIsProbedOnce(t *testing.T) {
 	}
 	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 1 {
 		t.Fatalf("one probe, one history record: %v", history)
+	}
+}
+
+func TestProbesToOneHostDoNotBurst(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	// Several nodes on one host: the probes go through the same pacer, so the
+	// target sees their starts at least one spacing apart.
+	const nodes = 4
+	proxies := make([]C.Proxy, 0, nodes)
+	for i := 0; i < nodes; i++ {
+		node, err := outbound.NewHttp(outbound.HttpOption{
+			Name:   fmt.Sprintf("paced-%d", i),
+			Server: "127.0.0.1",
+			Port:   target.port(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxies = append(proxies, adapter.NewProxy(node))
+	}
+	hc := NewHealthCheck(proxies, target.url(), 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	began := time.Now()
+	hc.check()
+	if elapsed := time.Since(began); elapsed < (nodes-1)*C.ProbeSpacing {
+		t.Fatalf("%d probes to one host must be spaced out over at least %s, took %s", nodes, (nodes-1)*C.ProbeSpacing, elapsed)
+	}
+	if target.connections() < nodes {
+		t.Fatalf("every node still gets its own probe, saw %d connections", target.connections())
+	}
+}
+
+func TestAPacedProbeOfAClosedPortIsStillNotHedged(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	target.close()
+	// Eight nodes on one closed port: the last waits for its slot longer than
+	// the hedge delay, then gets its answer at once — the hedge must count
+	// from the probe's start, not from the wait, or the node is probed twice.
+	const nodes = 8
+	proxies := make([]C.Proxy, 0, nodes)
+	for i := 0; i < nodes; i++ {
+		node, err := outbound.NewHttp(outbound.HttpOption{
+			Name:   fmt.Sprintf("closed-%d", i),
+			Server: "127.0.0.1",
+			Port:   target.port(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxies = append(proxies, adapter.NewProxy(node))
+	}
+	hc := NewHealthCheck(proxies, target.url(), 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	hc.check()
+	for _, p := range proxies {
+		if history := delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(target.url())); len(history) != 1 {
+			t.Fatalf("%s: a refused connection is one probe, got %v", p.Name(), history)
+		}
 	}
 }
