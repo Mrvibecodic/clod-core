@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	URL "net/url"
@@ -19,6 +20,14 @@ import (
 
 var (
 	ua string
+)
+
+// ErrTooManyRedirects and ErrRedirectDowngrade are sentinels so that a caller
+// can tell a refusal by policy from a transport failure: the first is fatal for
+// this address, the second means the server asked for cleartext.
+var (
+	ErrTooManyRedirects  = errors.New("stopped after 10 redirects")
+	ErrRedirectDowngrade = errors.New("refused redirect from https to plain http")
 )
 
 func UA() string {
@@ -86,7 +95,24 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 		TLSClientConfig: tlsConfig,
 	}
 
-	client := http.Client{Transport: transport}
+	client := http.Client{
+		Transport: transport,
+		// The default policy silently follows a redirect from https to
+		// http, sending the request and its headers over cleartext. The
+		// ten-hop limit is repeated here because setting CheckRedirect
+		// replaces the default policy entirely.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return ErrTooManyRedirects
+			}
+
+			if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return ErrRedirectDowngrade
+			}
+
+			return nil
+		},
+	}
 	return client.Do(req)
 }
 
