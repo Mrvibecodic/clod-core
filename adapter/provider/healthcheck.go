@@ -178,14 +178,47 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 
 		p := proxy
 		b.Go(func() error {
-			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
-			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
-			_, _ = p.URLTest(ctx, url, expectedStatus)
+			if !hc.probe(p, url, expectedStatus) {
+				return nil
+			}
 			log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
 			return nil
 		})
 	}
+}
+
+// probeConfirmDelay is the pause before the probe that confirms a failure:
+// long enough to outlast a lost packet or a momentary stall, short enough for
+// a node that really went down to leave the group within one check.
+const probeConfirmDelay = time.Second
+
+// probe tests p and records the result. A failure is recorded only when a
+// second probe confirms it: one lost packet or a stalled handshake otherwise
+// marks a live node dead until the next check. The result is false when the
+// check was cancelled before anything was recorded.
+func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) bool {
+	ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+	probeCtx, held := C.WithHeldProbeFailure(ctx)
+	_, _ = p.URLTest(probeCtx, url, expectedStatus)
+	cancel()
+
+	if !held.Failed {
+		return true
+	}
+
+	timer := time.NewTimer(probeConfirmDelay)
+	select {
+	case <-timer.C:
+	case <-hc.ctx.Done():
+		timer.Stop()
+		return false
+	}
+
+	ctx, cancel = context.WithTimeout(hc.ctx, hc.timeout)
+	defer cancel()
+	_, _ = p.URLTest(ctx, url, expectedStatus)
+	return true
 }
 
 func (hc *HealthCheck) close() {
