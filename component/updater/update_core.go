@@ -23,12 +23,15 @@ import (
 	"github.com/metacubex/http"
 )
 
+// Clod: the core updates itself from the Clod Core releases, never from
+// MetaCubeX — a stock build would silently replace the patches. There is no
+// alpha channel: both channels point at the latest release.
 const (
-	baseReleaseURL    = "https://github.com/MetaCubeX/mihomo/releases/latest/download/"
-	versionReleaseURL = "https://github.com/MetaCubeX/mihomo/releases/latest/download/version.txt"
+	baseReleaseURL    = "https://github.com/Mrvibecodic/clod-core/releases/latest/download/"
+	versionReleaseURL = "https://github.com/Mrvibecodic/clod-core/releases/latest/download/version.txt"
 
-	baseAlphaURL    = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/"
-	versionAlphaURL = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt"
+	baseAlphaURL    = baseReleaseURL
+	versionAlphaURL = versionReleaseURL
 
 	// MaxPackageFileSize is a maximum package file length in bytes. The largest
 	// package whose size is limited by this constant currently has the size of
@@ -69,8 +72,9 @@ func (u *CoreUpdater) CoreBaseName() string {
 			// mihomo-android-amd64
 			return fmt.Sprintf("mihomo-%s-%s", runtime.GOOS, runtime.GOARCH)
 		}
-		// mihomo-linux-amd64-v1
-		return fmt.Sprintf("mihomo-%s-%s-%s", runtime.GOOS, runtime.GOARCH, features.GOAMD64)
+		// Clod: amd64 assets carry no GOAMD64 level (mihomo-linux-amd64):
+		// every release is built for v1, so there is nothing to choose.
+		return fmt.Sprintf("mihomo-%s-%s", runtime.GOOS, runtime.GOARCH)
 	default:
 		// mihomo-linux-386
 		// mihomo-linux-mips64

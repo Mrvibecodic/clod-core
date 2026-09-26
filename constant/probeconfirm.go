@@ -3,7 +3,6 @@ package constant
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -30,6 +29,10 @@ type ProbeResult struct {
 	Status    int
 	Stage     string
 	Elapsed   time.Duration
+	// Answered is set by URLTest when the error is a definite answer from the
+	// network rather than a stall: the node's port is closed or its name does
+	// not resolve.
+	Answered bool
 }
 
 // OK reports whether the probe counts as a live node.
@@ -44,8 +47,7 @@ func (r *ProbeResult) Retryable() bool {
 	if r.Stage == ProbeStageStatus || r.Stage == ProbeStageAddress || r.Err == nil {
 		return false
 	}
-	msg := r.Err.Error()
-	return !strings.Contains(msg, "connection refused") && !strings.Contains(msg, "no such host")
+	return !r.Answered
 }
 
 func (r *ProbeResult) String() string {

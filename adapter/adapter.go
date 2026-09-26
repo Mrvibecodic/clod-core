@@ -167,6 +167,17 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	var satisfied bool
 	var status int
 	stage := C.ProbeStageAddress
+
+	// Probes to one host are spaced out, and the wait is not part of the
+	// measurement: the delay and the elapsed time start with the probe itself.
+	if err = C.ProbePace(ctx, C.ProbeHost(p.Addr())); err != nil {
+		// The caller gave up while the probe was waiting for its turn: nothing
+		// was measured, so nothing is recorded.
+		if held := C.HeldProbe(ctx); held != nil {
+			*held = C.ProbeResult{}
+		}
+		return 0, err
+	}
 	began := time.Now()
 
 	defer func() {
@@ -187,6 +198,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 				Status:    status,
 				Stage:     stage,
 				Elapsed:   time.Since(began),
+				Answered:  isDefiniteAnswer(err),
 			}
 			return
 		}

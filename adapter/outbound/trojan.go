@@ -367,7 +367,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 		dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := t.dialer.DialContext(ctx, "tcp", t.addr)
 			if err != nil {
-				return nil, fmt.Errorf("%s connect error: %s", t.addr, err.Error())
+				return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 			}
 			return c, nil
 		}

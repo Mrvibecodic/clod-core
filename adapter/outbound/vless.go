@@ -352,7 +352,7 @@ func (v *Vless) dialContext(ctx context.Context) (c net.Conn, err error) {
 func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	c, err := v.dialContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+		return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
 	}
 	defer func(c net.Conn) {
 		safeConnClose(c, err)
@@ -360,7 +360,7 @@ func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 
 	c, err = v.StreamConnContext(ctx, c, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+		return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
 	}
 	return NewConn(c, v), err
 }
@@ -373,7 +373,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 
 	c, err := v.dialContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+		return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
 	}
 	defer func(c net.Conn) {
 		safeConnClose(c, err)
@@ -381,7 +381,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 
 	c, err = v.StreamConnContext(ctx, c, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+		return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
 	}
 
 	if v.option.XUDP {
@@ -572,7 +572,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 		dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := v.dialer.DialContext(ctx, "tcp", v.addr)
 			if err != nil {
-				return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+				return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
 			}
 			return c, nil
 		}
