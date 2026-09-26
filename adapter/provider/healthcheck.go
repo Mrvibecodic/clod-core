@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -185,7 +186,7 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 		b.Go(func() error {
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
 			outcome := hc.probe(p, url, expectedStatus)
-			if outcome == probeCancelled {
+			if outcome == probeCancelled || outcome == probeShared {
 				return nil
 			}
 			tally.total.Add(1)
@@ -212,6 +213,7 @@ type probeOutcome int
 
 const (
 	probeCancelled probeOutcome = iota
+	probeShared                 // another group's check of the same node was already running
 	probePassed
 	probeRecovered // the first probe stalled, the second passed
 	probeStalled   // both probes failed
@@ -223,6 +225,24 @@ const (
 // DNS, the way to the servers) rather than at the nodes.
 type probeTally struct {
 	total, recovered, stalled atomic.Int32
+}
+
+// probeFlights are the node probes in progress, by node, URL and expected
+// status. A node that stands in several groups was probed once per group in
+// the same round; now the first group probes it and the others take the
+// outcome of that probe, which is already in the shared history.
+var probeFlights = struct {
+	sync.Mutex
+	m map[string]*probeFlight
+}{m: map[string]*probeFlight{}}
+
+type probeFlight struct {
+	done    chan struct{}
+	outcome probeOutcome
+}
+
+func probeFlightKey(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) string {
+	return fmt.Sprintf("%p|%s|%s", p, url, expectedStatus.String())
 }
 
 // probeRun is one URLTest running in the background in held mode.
@@ -268,6 +288,33 @@ func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRang
 		return probePassed
 	}
 
+	key := probeFlightKey(p, url, expectedStatus)
+	probeFlights.Lock()
+	if flight, running := probeFlights.m[key]; running {
+		probeFlights.Unlock()
+		select {
+		case <-flight.done:
+			log.Debugln("[Проба] %s: проба уже шла у другой группы, взят её результат", p.Name())
+			return probeShared
+		case <-hc.ctx.Done():
+			return probeCancelled
+		}
+	}
+	flight := &probeFlight{done: make(chan struct{})}
+	probeFlights.m[key] = flight
+	probeFlights.Unlock()
+	outcome := hc.probeOnce(p, recorder, url, expectedStatus)
+	probeFlights.Lock()
+	delete(probeFlights.m, key)
+	probeFlights.Unlock()
+	flight.outcome = outcome
+	close(flight.done)
+	return outcome
+}
+
+// probeOnce is the probe itself, with the hedge; probe wraps it so that one
+// node is probed once at a time whichever groups ask.
+func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16]) probeOutcome {
 	first := hc.startProbe(p, url, expectedStatus)
 	defer first.cancel()
 	hedge := time.NewTimer(probeHedgeDelay)

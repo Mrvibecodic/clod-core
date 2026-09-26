@@ -37,6 +37,10 @@ func newProbeTarget(t *testing.T, slow time.Duration, plan ...string) *probeTarg
 	return target
 }
 
+func (pt *probeTarget) port() int {
+	return pt.listener.Addr().(*net.TCPAddr).Port
+}
+
 func (pt *probeTarget) url() string {
 	return "http://" + pt.listener.Addr().String() + "/generate_204"
 }
@@ -69,8 +73,19 @@ func (pt *probeTarget) serve() {
 		}
 		go func() {
 			defer conn.Close()
-			if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+			reader := bufio.NewReader(conn)
+			request, err := http.ReadRequest(reader)
+			if err != nil {
 				return
+			}
+			// A node of type http reaches the target through CONNECT first.
+			if request.Method == http.MethodConnect {
+				if _, err := conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n")); err != nil {
+					return
+				}
+				if _, err := http.ReadRequest(reader); err != nil {
+					return
+				}
 			}
 			// Loopback answers within a millisecond, which URLTest rounds to a
 			// delay of 0 — the value that means "failed"; a real node is slower.
@@ -182,5 +197,33 @@ func TestAClosedPortIsNotHedged(t *testing.T) {
 	}
 	if elapsed >= probeHedgeDelay {
 		t.Fatalf("a refused connection is an answer, no second probe: %s", elapsed)
+	}
+}
+
+func TestANodeInTwoGroupsIsProbedOnce(t *testing.T) {
+	target := newProbeTarget(t, 0, "ok", "ok")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	first := NewHealthCheck([]C.Proxy{proxy}, target.url(), 1000, 0, false, nil)
+	second := NewHealthCheck([]C.Proxy{proxy}, target.url(), 1000, 0, false, nil)
+	t.Cleanup(first.close)
+	t.Cleanup(second.close)
+
+	outcomes := make(chan probeOutcome, 2)
+	for _, hc := range []*HealthCheck{first, second} {
+		hc := hc
+		go func() { outcomes <- hc.probe(proxy, target.url(), nil) }()
+	}
+	got := map[probeOutcome]int{}
+	for i := 0; i < 2; i++ {
+		got[<-outcomes]++
+	}
+	if got[probePassed] != 1 || got[probeShared] != 1 {
+		t.Fatalf("one group probes, the other takes the outcome: %v", got)
+	}
+	if target.connections() != 1 {
+		t.Fatalf("the node must see one probe, saw %d", target.connections())
+	}
+	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 1 {
+		t.Fatalf("one probe, one history record: %v", history)
 	}
 }
