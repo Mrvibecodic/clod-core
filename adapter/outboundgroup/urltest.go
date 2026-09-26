@@ -100,6 +100,45 @@ func (u *URLTest) healthCheck() {
 	u.fastSingle.Reset()
 }
 
+// flakyWindow is how many latest probes count when a node is ranked: every
+// failure among them adds flakyPenalty to its delay. A node that drops probes
+// but passes the second one stays alive, yet loses to a steady node unless
+// that one is slower by more than the penalty.
+const flakyWindow = 3
+
+// flakyPenalty is a quarter of the probe timeout per recent failure.
+func (u *URLTest) flakyPenalty() uint32 {
+	return uint32(u.testTimeout) / 4
+}
+
+// score ranks p for url-test: its last delay plus the penalty for recent
+// failures; 0xffff for a dead node.
+func (u *URLTest) score(p C.Proxy) uint32 {
+	delay := uint32(p.LastDelayForTestUrl(u.testUrl))
+	if delay >= 0xffff {
+		return delay
+	}
+	var history []C.DelayHistory
+	if h, ok := p.(interface {
+		DelayHistoryForTestUrl(url string) []C.DelayHistory
+	}); ok {
+		history = h.DelayHistoryForTestUrl(u.testUrl)
+	} else {
+		history = p.ExtraDelayHistories()[u.testUrl].History
+	}
+	var failures uint32
+	for i := len(history) - 1; i >= 0 && i >= len(history)-flakyWindow; i-- {
+		if history[i].Delay == 0 {
+			failures++
+		}
+	}
+	score := delay + failures*u.flakyPenalty()
+	if score > 0xfffe {
+		score = 0xfffe
+	}
+	return score
+}
+
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		proxies := u.GetProxies(touch)
@@ -116,7 +155,7 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		}
 
 		fast := proxies[0]
-		minDelay := fast.LastDelayForTestUrl(u.testUrl)
+		minScore := u.score(fast)
 		fastNotExist := true
 
 		for _, proxy := range proxies[1:] {
@@ -128,15 +167,15 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 				continue
 			}
 
-			delay := proxy.LastDelayForTestUrl(u.testUrl)
-			if delay < minDelay {
+			score := u.score(proxy)
+			if score < minScore {
 				fast = proxy
-				minDelay = delay
+				minScore = score
 			}
 
 		}
 		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.score(u.fastNode) > minScore+uint32(u.tolerance) {
 			u.fastNode = fast
 		}
 		return u.fastNode, nil

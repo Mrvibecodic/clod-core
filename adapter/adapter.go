@@ -165,42 +165,25 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 // implements C.Proxy
 func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (t uint16, err error) {
 	var satisfied bool
+	var status int
+	stage := C.ProbeStageAddress
+	began := time.Now()
 
 	defer func() {
-		if held := C.HeldProbeFailure(ctx); held != nil && !satisfied {
-			held.Failed = true
+		if held := C.HeldProbe(ctx); held != nil {
+			*held = C.ProbeResult{
+				Held:      true,
+				Time:      time.Now(),
+				Delay:     t,
+				Err:       err,
+				Satisfied: satisfied,
+				Status:    status,
+				Stage:     stage,
+				Elapsed:   time.Since(began),
+			}
 			return
 		}
-		alive := err == nil
-		record := C.DelayHistory{Time: time.Now()}
-		if alive {
-			record.Delay = t
-		}
-
-		p.alive.Store(alive)
-		p.history.Put(record)
-		if p.history.Len() > defaultHistoriesNum {
-			p.history.Pop()
-		}
-
-		state, _ := p.extra.LoadOrStoreFn(url, func() *internalProxyState {
-			return &internalProxyState{
-				history: queue.New[C.DelayHistory](defaultHistoriesNum),
-				alive:   atomic.NewBool(true),
-			}
-		})
-
-		if !satisfied {
-			record.Delay = 0
-			alive = false
-		}
-
-		state.alive.Store(alive)
-		state.history.Put(record)
-		if state.history.Len() > defaultHistoriesNum {
-			state.history.Pop()
-		}
-
+		p.recordURLTest(url, t, err, satisfied, time.Now())
 	}()
 
 	unifiedDelay := UnifiedDelay.Load()
@@ -210,11 +193,13 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 		return
 	}
 
+	stage = C.ProbeStageDial
 	start := time.Now()
 	instance, err := p.DialContext(ctx, &addr)
 	if err != nil {
 		return
 	}
+	stage = C.ProbeStageRequest
 	defer func() {
 		_ = instance.Close()
 	}()
@@ -278,8 +263,65 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	}
 
 	satisfied = resp != nil && (expectedStatus == nil || expectedStatus.Check(uint16(resp.StatusCode)))
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	if !satisfied {
+		stage = C.ProbeStageStatus
+	}
 	t = uint16(time.Since(start) / time.Millisecond)
 	return
+}
+
+// recordURLTest writes the outcome of a probe of url into the history.
+func (p *Proxy) recordURLTest(url string, t uint16, err error, satisfied bool, at time.Time) {
+	alive := err == nil
+	record := C.DelayHistory{Time: at}
+	if alive {
+		record.Delay = t
+	}
+
+	p.alive.Store(alive)
+	p.putHistory(p.history, record)
+
+	state := p.stateForTestUrl(url)
+
+	if !satisfied {
+		record.Delay = 0
+		alive = false
+	}
+
+	state.alive.Store(alive)
+	p.putHistory(state.history, record)
+}
+
+// RecordProbe implements C.ProbeRecorder
+func (p *Proxy) RecordProbe(url string, result *C.ProbeResult) {
+	p.recordURLTest(url, result.Delay, result.Err, result.Satisfied, result.Time)
+}
+
+// RecordSoftFailure implements C.ProbeRecorder
+func (p *Proxy) RecordSoftFailure(url string, at time.Time) {
+	record := C.DelayHistory{Time: at}
+	p.putHistory(p.history, record)
+	p.putHistory(p.stateForTestUrl(url).history, record)
+}
+
+func (p *Proxy) stateForTestUrl(url string) *internalProxyState {
+	state, _ := p.extra.LoadOrStoreFn(url, func() *internalProxyState {
+		return &internalProxyState{
+			history: queue.New[C.DelayHistory](defaultHistoriesNum),
+			alive:   atomic.NewBool(true),
+		}
+	})
+	return state
+}
+
+func (p *Proxy) putHistory(history *queue.Queue[C.DelayHistory], record C.DelayHistory) {
+	history.Put(record)
+	if history.Len() > defaultHistoriesNum {
+		history.Pop()
+	}
 }
 
 func NewProxy(adapter C.ProxyAdapter) *Proxy {
