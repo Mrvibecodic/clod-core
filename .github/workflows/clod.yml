@@ -102,7 +102,10 @@ jobs:
             cp dist/mihomo.exe "${NAME}.exe"
             zip -j "out/${NAME}-${VERSION}.zip" "${NAME}.exe"
           else
-            gzip -c dist/mihomo > "out/${NAME}-${VERSION}.gz"
+            # Имя внутри gzip-заголовка = имя исходного файла: обновитель ядра
+            # (gzFileUnpack) распаковывает по нему и ждёт ${NAME}, а не «mihomo»
+            cp dist/mihomo "$NAME"
+            gzip -c "$NAME" > "out/${NAME}-${VERSION}.gz"
           fi
           cd out && for f in *; do sha256sum "$f" > "$f.sha256"; done
 
@@ -138,4 +141,8 @@ jobs:
             echo "База: $(cat .github/clod-base)."
             echo "Отличия от MetaCubeX/mihomo — коммиты ветки поверх базы: $(git log --oneline "$(awk '{print $NF}' .github/clod-base)"..HEAD | wc -l)."
           } > notes.md
+          # version.txt читает обновитель самого ядра (component/updater) и
+          # сборка ПК-клиента (scripts/prebuild.mjs): содержимое равно
+          # constant.Version собранных бинарей.
+          printf '%s\n' "$VERSION" > out/version.txt
           gh release create "$GITHUB_REF_NAME" out/* --title "Clod Core ${VERSION}" --notes-file notes.md
