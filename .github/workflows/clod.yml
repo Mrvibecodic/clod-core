@@ -1,0 +1,141 @@
+name: Clod Core
+
+# Сборка ядра Clod: проверка на каждый пуш в main/android и релиз по тегу core-v*.
+# Upstream-workflow (build/test/trigger-cmfa-update) срабатывают только на ветку
+# Alpha и теги v*, поэтому здесь теги называются core-v…, а не v…
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, android]
+    tags: ["core-v*"]
+    paths-ignore: ["docs/**", "README.md", ".github/ISSUE_TEMPLATE/**"]
+  pull_request:
+    branches: [main, android]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+
+      - name: Vet
+        run: go vet -tags with_gvisor ./...
+
+      - name: Test
+        env:
+          SKIP_CONCURRENT_TEST: "1"
+          SKIP_INTEROP_TEST: "1"
+        run: go test ./... -tags with_gvisor -count=1
+
+  build:
+    # Бинари нужны только ПК; ветка android идёт в клиент Android исходниками
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/core-v') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        jobs:
+          # Имена как у релизов MetaCubeX (mihomo-<os>-<arch>-<версия>), чтобы их
+          # разбирал тот же код клиента. amd64 собран под GOAMD64=v1: у MetaCubeX
+          # «amd64» — это v3 (нужен AVX2), здесь без этого требования.
+          - { goos: windows, goarch: amd64, goamd64: v1 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: linux, goarch: amd64, goamd64: v1 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64, goamd64: v1 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/core-v* ]]; then
+            VERSION="${GITHUB_REF_NAME#core-}"
+          else
+            BASE="$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' .github/clod-base || echo v0.0.0)"
+            VERSION="${BASE}-clod-$(git rev-parse --short HEAD)"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "BUILDTIME=$(date -u)" >> "$GITHUB_ENV"
+
+      - name: Update CA
+        run: |
+          sudo apt-get update && sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.jobs.goos }}
+          GOARCH: ${{ matrix.jobs.goarch }}
+          GOAMD64: ${{ matrix.jobs.goamd64 }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-extldflags --static -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
+            -o dist/
+          mkdir -p out
+          NAME="mihomo-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = windows ]; then
+            cp dist/mihomo.exe "${NAME}.exe"
+            zip -j "out/${NAME}-${VERSION}.zip" "${NAME}.exe"
+          else
+            gzip -c dist/mihomo > "out/${NAME}-${VERSION}.gz"
+          fi
+          cd out && for f in *; do sha256sum "$f" > "$f.sha256"; done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.goarch }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/core-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#core-}"
+          {
+            echo "Ядро Clod ${VERSION}."
+            echo
+            echo "База: $(cat .github/clod-base)."
+            echo "Отличия от MetaCubeX/mihomo — коммиты ветки поверх базы: $(git log --oneline "$(awk '{print $NF}' .github/clod-base)"..HEAD | wc -l)."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" out/* --title "Clod Core ${VERSION}" --notes-file notes.md
