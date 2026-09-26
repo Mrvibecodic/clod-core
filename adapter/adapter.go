@@ -166,8 +166,13 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (t uint16, err error) {
 	var satisfied bool
 
+	probeStart := time.Now()
+
 	defer func() {
 		alive := err == nil
+		if (!alive || !satisfied) && (ctx.Err() == context.Canceled || C.ProbeHolding(probeStart) || C.ProbeHolding(time.Now())) {
+			return
+		}
 		record := C.DelayHistory{Time: time.Now()}
 		if alive {
 			record.Delay = t

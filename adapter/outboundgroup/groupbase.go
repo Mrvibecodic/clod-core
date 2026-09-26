@@ -267,6 +267,10 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		return
 	}
 
+	if C.ProbeHolding(time.Now()) {
+		return
+	}
+
 	if errors.Is(err, C.ErrNotSupport) {
 		return
 	}
