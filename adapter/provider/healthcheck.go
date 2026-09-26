@@ -133,21 +133,26 @@ func (hc *HealthCheck) check() {
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
-		hc.execute(b, hc.url, id, option)
+		tally := &probeTally{}
+		hc.execute(b, hc.url, id, option, tally)
 
 		// execute extra health check
 		if len(hc.extra) != 0 {
 			for url, option := range hc.extra {
-				hc.execute(b, url, id, option)
+				hc.execute(b, url, id, option, tally)
 			}
 		}
 		_ = b.Wait()
+		if stalls := tally.recovered.Load() + tally.stalled.Load(); stalls > 1 {
+			log.Warnln("[Проба] за проверку первая проба зависла или оборвалась у %d из %d узлов: повторная прошла у %d, не прошла у %d",
+				stalls, tally.total.Load(), tally.recovered.Load(), tally.stalled.Load())
+		}
 		log.Debugln("Finish A Health Checking {%s}", id)
 		return struct{}{}, nil
 	})
 }
 
-func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption) {
+func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption, tally *probeTally) {
 	url = strings.TrimSpace(url)
 	if len(url) == 0 {
 		log.Debugln("Health Check has been skipped due to testUrl is empty, {%s}", uid)
@@ -178,14 +183,104 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 
 		p := proxy
 		b.Go(func() error {
-			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
-			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
-			_, _ = p.URLTest(ctx, url, expectedStatus)
+			outcome := hc.probe(p, url, expectedStatus)
+			if outcome == probeCancelled {
+				return nil
+			}
+			tally.total.Add(1)
+			switch outcome {
+			case probeRecovered:
+				tally.recovered.Add(1)
+			case probeStalled:
+				tally.stalled.Add(1)
+			}
 			log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
 			return nil
 		})
 	}
+}
+
+// probeConfirmDelay is the pause before the probe that confirms a failure:
+// long enough to outlast a lost packet or a momentary stall, short enough for
+// a node that really went down to leave the group within one check.
+const probeConfirmDelay = time.Second
+
+type probeOutcome int
+
+const (
+	probeCancelled probeOutcome = iota
+	probePassed
+	probeRecovered // stalled, passed on the second probe
+	probeStalled   // stalled on both probes
+	probeRefused   // failed with an answer: closed port, missing name, bad status
+)
+
+// probeTally counts the outcomes of one health check round. Many nodes stalling
+// on their first probe in the same round point at the local side (network,
+// DNS, the way to the servers) rather than at the nodes.
+type probeTally struct {
+	total, recovered, stalled atomic.Int32
+}
+
+// probe tests p and records the result. A failure that may be a momentary
+// stall is checked by a second probe: if that one passes, the node stays alive,
+// but the failed probe is kept in its history so url-test ranks the node below
+// steady ones. A failure that is an answer (closed port, missing name,
+// unexpected status) or that the second probe confirms marks the node dead.
+func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) probeOutcome {
+	recorder, ok := p.(C.ProbeRecorder)
+	if !ok {
+		ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+		defer cancel()
+		_, _ = p.URLTest(ctx, url, expectedStatus)
+		return probePassed
+	}
+
+	first := hc.heldProbe(p, url, expectedStatus)
+	if !first.Held || hc.ctx.Err() != nil {
+		return probeCancelled
+	}
+	if first.OK() {
+		recorder.RecordProbe(url, first)
+		return probePassed
+	}
+	if !first.Retryable() {
+		recorder.RecordProbe(url, first)
+		log.Warnln("[Проба] %s: не отвечает (%s)", p.Name(), first)
+		return probeRefused
+	}
+
+	timer := time.NewTimer(probeConfirmDelay)
+	select {
+	case <-timer.C:
+	case <-hc.ctx.Done():
+		timer.Stop()
+		return probeCancelled
+	}
+
+	second := hc.heldProbe(p, url, expectedStatus)
+	if !second.Held || hc.ctx.Err() != nil {
+		return probeCancelled
+	}
+	if second.OK() {
+		recorder.RecordSoftFailure(url, first.Time)
+		recorder.RecordProbe(url, second)
+		log.Warnln("[Проба] %s: первая проба не прошла (%s), повторная прошла: %s", p.Name(), first, second)
+		return probeRecovered
+	}
+	recorder.RecordProbe(url, first)
+	recorder.RecordProbe(url, second)
+	log.Warnln("[Проба] %s: не отвечает (%s), повторная проба тоже (%s)", p.Name(), first, second)
+	return probeStalled
+}
+
+func (hc *HealthCheck) heldProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) *C.ProbeResult {
+	ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+	defer cancel()
+	ctx, held := C.WithHeldProbe(ctx)
+	_, _ = p.URLTest(ctx, url, expectedStatus)
+	return held
 }
 
 func (hc *HealthCheck) close() {
