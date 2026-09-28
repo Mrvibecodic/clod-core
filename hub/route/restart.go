@@ -3,7 +3,6 @@ package route
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"runtime"
 	"syscall"
 
@@ -45,17 +44,14 @@ func restart(w http.ResponseWriter, r *http.Request) {
 func restartExecutable(execPath string) {
 	var err error
 	executor.Shutdown()
+	// clod: на Windows exec нет, и апстрим запускал новое ядро дочерним
+	// процессом, а сам выходил. Ядро Clod Clash всегда живёт под хозяином —
+	// службой или приложением, — и хозяин, увидев выход, поднимал с того же
+	// файла ещё одно ядро: копия, о которой никто не знает, держала порт, а
+	// ядро хозяина оставалось без него до перезагрузки. Поэтому здесь ядро
+	// только выходит, а поднимает его с обновлённого файла хозяин.
 	if runtime.GOOS == "windows" {
-		cmd := exec.Command(execPath, os.Args[1:]...)
-		log.Infoln("restarting: %q %q", execPath, os.Args[1:])
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Start()
-		if err != nil {
-			log.Fatalln("restarting: %s", err)
-		}
-
+		log.Infoln("restarting: exiting, the supervisor starts %q again", execPath)
 		os.Exit(0)
 	}
 
