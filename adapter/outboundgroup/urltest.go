@@ -27,6 +27,11 @@ type URLTest struct {
 	disableUDP     bool
 	fastNode       C.Proxy
 	fastSingle     *singledo.Single[C.Proxy]
+	// carried is the object that replaced the current node on a provider
+	// update, and carriedScore the old object's score: the new object has no
+	// checks yet and competes with the old one's result until its first one.
+	carried      C.Proxy
+	carriedScore uint32
 }
 
 func (u *URLTest) Now() string {
@@ -164,6 +169,9 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
 				// A provider update replaces the node objects under the same
 				// names; follow the current object, the old one gets no checks.
+				if proxy != u.fastNode && u.fastNode.LastDelayForTestUrl(u.testUrl) != 0xffff {
+					u.carried, u.carriedScore = proxy, u.score(u.fastNode)
+				}
 				u.fastNode = proxy
 				fastNotExist = false
 			}
@@ -181,10 +189,16 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		}
 		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) {
 			u.fastNode = fast
-		} else if u.fastNode.LastDelayForTestUrl(u.testUrl) != 0xffff && u.score(u.fastNode) > minScore+uint32(u.tolerance) {
-			// A node replaced by a provider update is alive but not measured
-			// yet: it keeps the selection until its first check.
-			u.fastNode = fast
+		} else {
+			current := u.score(u.fastNode)
+			if u.fastNode == u.carried && u.fastNode.LastDelayForTestUrl(u.testUrl) == 0xffff {
+				current = u.carriedScore
+			} else {
+				u.carried = nil
+			}
+			if current > minScore+uint32(u.tolerance) {
+				u.fastNode = fast
+			}
 		}
 		return u.fastNode, nil
 	})
