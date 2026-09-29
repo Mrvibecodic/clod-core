@@ -330,14 +330,18 @@ func (gb *GroupBase) healthCheck() {
 	}
 
 	wg.Wait()
-	gb.failedTesting.Store(false)
+	// The counter is cleared before the check is marked finished: a failure
+	// landing in between must not see the count left from before the check.
 	gb.failedTestMux.Lock()
 	gb.failedTimes = 0
 	gb.failedTestMux.Unlock()
+	gb.failedTesting.Store(false)
 }
 
 func (gb *GroupBase) onDialSuccess() {
 	if !gb.failedTesting.Load() {
+		gb.failedTestMux.Lock()
 		gb.failedTimes = 0
+		gb.failedTestMux.Unlock()
 	}
 }
