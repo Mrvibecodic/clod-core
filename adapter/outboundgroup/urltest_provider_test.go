@@ -19,6 +19,7 @@ type urlTestProxy struct {
 func (p *urlTestProxy) Name() string                                   { return p.name }
 func (p *urlTestProxy) AliveForTestUrl(string) bool                    { return p.alive }
 func (p *urlTestProxy) DelayHistoryForTestUrl(string) []C.DelayHistory { return nil }
+func (p *urlTestProxy) ProxyInfo() C.ProxyInfo                         { return C.ProxyInfo{} }
 func (p *urlTestProxy) LastDelayForTestUrl(string) uint16 {
 	if !p.alive {
 		return 0xffff

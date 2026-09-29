@@ -96,3 +96,28 @@ func TestURLTestCarriesTheScoreThroughTwoReplacements(t *testing.T) {
 		t.Fatalf("a node 20 ms slower than the carried score took over: %s", got)
 	}
 }
+
+// After one provider replaces the current node, the group follows that
+// provider's new object, not a namesake from another provider.
+func TestURLTestFollowsTheReplacementFromTheSameProvider(t *testing.T) {
+	xa := &measuredProxy{name: "X", delay: 120, alive: true, provider: "A"}
+	ya := &measuredProxy{name: "Y", delay: 300, alive: true, provider: "A"}
+	xb := &measuredProxy{name: "X", delay: 100, alive: true, provider: "B"}
+	a := &measuredProvider{proxies: []C.Proxy{xa, ya}, version: 1}
+	b := &measuredProvider{proxies: []C.Proxy{xb}, version: 1}
+	group, err := NewURLTest(GroupCommonOption{Name: "auto", URL: "https://probe.invalid/"},
+		URLTestOption{Tolerance: 50}, xa, []P.ProxyProvider{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := group.fast(false); got != C.Proxy(xb) {
+		t.Fatal("initial choice is not X of B")
+	}
+	nb := &measuredProxy{name: "X", delay: 0xffff, alive: true, provider: "B"}
+	b.proxies = []C.Proxy{nb}
+	b.version++
+	group.fastSingle.Reset()
+	if got := group.fast(false); got != C.Proxy(nb) {
+		t.Fatal("the group moved to X of another provider instead of the replacement")
+	}
+}
