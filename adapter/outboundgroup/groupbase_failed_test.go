@@ -47,7 +47,20 @@ func TestGroupFailuresDuringACheckDoNotStartAnother(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		gb.onDialFailed(C.Vless, failure, gb.healthCheck)
 	}
-	time.Sleep(100 * time.Millisecond)
+	// Every failure is counted while the check still runs: none of them may
+	// wait for it to end.
+	counted := func() int {
+		gb.failedTestMux.Lock()
+		defer gb.failedTestMux.Unlock()
+		return gb.failedTimes
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for counted() < 12 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := counted(); got != 12 {
+		t.Fatalf("failures counted during the check = %d, want 12", got)
+	}
 	close(provider.release)
 	time.Sleep(200 * time.Millisecond)
 
