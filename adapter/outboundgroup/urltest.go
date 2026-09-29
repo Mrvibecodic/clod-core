@@ -236,7 +236,10 @@ func (u *URLTest) Proxies() []C.Proxy {
 }
 
 func (u *URLTest) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
-	return u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
+	dm, err := u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
+	// A choice cached while the test ran was made from the old delays.
+	u.fastSingle.Reset()
+	return dm, err
 }
 
 func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*URLTest, error) {
