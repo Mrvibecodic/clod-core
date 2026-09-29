@@ -158,8 +158,13 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		minScore := u.score(fast)
 		fastNotExist := true
 
-		for _, proxy := range proxies[1:] {
+		// The whole list is scanned, the first node included: a current node
+		// standing first must not count as missing and lose the tolerance.
+		for _, proxy := range proxies {
 			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
+				// A provider update replaces the node objects under the same
+				// names; follow the current object, the old one gets no checks.
+				u.fastNode = proxy
 				fastNotExist = false
 			}
 
@@ -174,8 +179,11 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 			}
 
 		}
-		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.score(u.fastNode) > minScore+uint32(u.tolerance) {
+		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) {
+			u.fastNode = fast
+		} else if u.fastNode.LastDelayForTestUrl(u.testUrl) != 0xffff && u.score(u.fastNode) > minScore+uint32(u.tolerance) {
+			// A node replaced by a provider update is alive but not measured
+			// yet: it keeps the selection until its first check.
 			u.fastNode = fast
 		}
 		return u.fastNode, nil
