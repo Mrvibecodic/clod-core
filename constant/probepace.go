@@ -53,12 +53,13 @@ func ProbePace(ctx context.Context, host string) error {
 	if host == "" || ctx.Value(probePacedKey{}) != nil {
 		return nil
 	}
-	wait := reserveProbeStart(host, time.Now())
+	limit := time.Duration(-1)
 	if deadline, ok := ctx.Deadline(); ok {
-		if room := time.Until(deadline) - ProbeReserve; wait > room {
-			wait = room
+		if limit = time.Until(deadline) - ProbeReserve; limit < 0 {
+			limit = 0
 		}
 	}
+	wait := reserveProbeStart(host, time.Now(), limit)
 	if wait <= 0 {
 		return nil
 	}
@@ -73,8 +74,11 @@ func ProbePace(ctx context.Context, host string) error {
 }
 
 // reserveProbeStart books the next start slot for host and returns how long
-// the caller has to wait for it.
-func reserveProbeStart(host string, now time.Time) time.Duration {
+// the caller has to wait for it, at most limit (a negative limit is none). A
+// caller that cannot wait for its slot starts earlier and books nothing past
+// its real start: otherwise every short-deadline probe would push the probes
+// behind it back without spacing anything itself.
+func reserveProbeStart(host string, now time.Time, limit time.Duration) time.Duration {
 	probePacer.Lock()
 	defer probePacer.Unlock()
 	if len(probePacer.next) > 1024 {
@@ -85,9 +89,15 @@ func reserveProbeStart(host string, now time.Time) time.Duration {
 		}
 	}
 	start := now
-	if next, ok := probePacer.next[host]; ok && next.After(now) {
+	next, booked := probePacer.next[host]
+	if booked && next.After(now) {
 		start = next
 	}
-	probePacer.next[host] = start.Add(ProbeSpacing)
+	if limit >= 0 && start.Sub(now) > limit {
+		start = now.Add(limit)
+	}
+	if after := start.Add(ProbeSpacing); !booked || after.After(next) {
+		probePacer.next[host] = after
+	}
 	return start.Sub(now)
 }
