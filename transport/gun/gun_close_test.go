@@ -19,9 +19,11 @@ func TestCloseCancelsAPendingStream(t *testing.T) {
 	}
 	var calls atomic.Int32
 	block := make(chan struct{})
+	arrived := make(chan struct{})
 	srv := &stdhttp.Server{Handler: stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		n := calls.Add(1)
 		if n == 1 {
+			close(arrived)
 			select { // never answer the first stream
 			case <-r.Context().Done():
 				t.Log("server saw first stream cancelled")
@@ -48,7 +50,11 @@ func TestCloseCancelsAPendingStream(t *testing.T) {
 	defer tr.Close()
 
 	c1, _ := tr.Dial()
-	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-arrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first stream did not reach the server")
+	}
 	start := time.Now()
 	c1.Close()
 	done := make(chan error, 1)
@@ -64,9 +70,18 @@ func TestCloseCancelsAPendingStream(t *testing.T) {
 	if _, err := c2.Write([]byte("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if err := c2.(*Conn).Init(); err != nil {
-		t.Fatalf("second stream failed: %v", err)
+	second := make(chan error, 1)
+	go func() { second <- c2.(*Conn).Init() }()
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatalf("second stream failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second stream got no answer")
 	}
 	c2.Close()
-	t.Logf("dials=%d (1 = transport connection reused)", dials.Load())
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dials = %d, want 1: the transport connection must be reused", n)
+	}
 }
