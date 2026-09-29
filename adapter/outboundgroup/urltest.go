@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/callback"
@@ -32,6 +33,9 @@ type URLTest struct {
 	// checks yet and competes with the old one's result until its first one.
 	carried      C.Proxy
 	carriedScore uint32
+	// fastMu serialises the choice: a Reset of fastSingle while a choice is
+	// being made lets a second one start alongside the first.
+	fastMu sync.Mutex
 }
 
 func (u *URLTest) Now() string {
@@ -146,6 +150,8 @@ func (u *URLTest) score(p C.Proxy) uint32 {
 
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
+		u.fastMu.Lock()
+		defer u.fastMu.Unlock()
 		proxies := u.GetProxies(touch)
 		if u.selected != "" {
 			for _, proxy := range proxies {
@@ -159,23 +165,45 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 			}
 		}
 
+		// Find the current node in the whole list, the first place included:
+		// the same object if it is still there (a node of another provider
+		// with the same name must not take its place), otherwise the first
+		// object with its name — a provider update replaced it, and the old
+		// object gets no more checks.
+		var current C.Proxy
+		if u.fastNode != nil {
+			for _, proxy := range proxies {
+				if proxy == u.fastNode {
+					current = proxy
+					break
+				}
+			}
+			if current == nil {
+				for _, proxy := range proxies {
+					if proxy.Name() == u.fastNode.Name() {
+						current = proxy
+						break
+					}
+				}
+				if current != nil {
+					if u.fastNode.LastDelayForTestUrl(u.testUrl) != 0xffff {
+						u.carried, u.carriedScore = current, u.score(u.fastNode)
+					} else if u.fastNode == u.carried {
+						// Replaced again before its first check: the old
+						// score goes on to the newest object.
+						u.carried = current
+					}
+				}
+			}
+		}
+		fastNotExist := current == nil
+		if current != nil {
+			u.fastNode = current
+		}
+
 		fast := proxies[0]
 		minScore := u.score(fast)
-		fastNotExist := true
-
-		// The whole list is scanned, the first node included: a current node
-		// standing first must not count as missing and lose the tolerance.
 		for _, proxy := range proxies {
-			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
-				// A provider update replaces the node objects under the same
-				// names; follow the current object, the old one gets no checks.
-				if proxy != u.fastNode && u.fastNode.LastDelayForTestUrl(u.testUrl) != 0xffff {
-					u.carried, u.carriedScore = proxy, u.score(u.fastNode)
-				}
-				u.fastNode = proxy
-				fastNotExist = false
-			}
-
 			if !proxy.AliveForTestUrl(u.testUrl) {
 				continue
 			}

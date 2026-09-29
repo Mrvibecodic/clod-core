@@ -44,3 +44,55 @@ func TestURLTestNeverMeasuredNodeDoesNotHoldTheGroup(t *testing.T) {
 		t.Fatalf("after the check = %s, want HK-1", got)
 	}
 }
+
+// A node of another provider with the same name does not take the place of
+// the current node while the current object is still listed.
+func TestURLTestKeepsTheSameObjectAmongNamesakes(t *testing.T) {
+	a := &measuredProxy{name: "HK-1", delay: 50, alive: true}
+	b := &measuredProxy{name: "HK-1", delay: 90, alive: true}
+	provider := &measuredProvider{proxies: []C.Proxy{a, b}, version: 1}
+	group, err := NewURLTest(GroupCommonOption{Name: "auto", URL: "https://probe.invalid/"},
+		URLTestOption{Tolerance: 50}, a, []P.ProxyProvider{provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := group.fast(false); got != C.Proxy(a) {
+		t.Fatal("initial choice is not the faster namesake")
+	}
+	for i := 0; i < 3; i++ {
+		group.fastSingle.Reset()
+		if got := group.fast(false); got != C.Proxy(a) {
+			t.Fatalf("round %d: the group moved to the slower namesake", i)
+		}
+	}
+}
+
+// A node replaced twice before its first check keeps competing with the
+// score of the last measured object.
+func TestURLTestCarriesTheScoreThroughTwoReplacements(t *testing.T) {
+	old := &measuredProxy{name: "current", delay: 100, alive: true}
+	other := &measuredProxy{name: "other", delay: 0xffff, alive: true}
+	provider := &measuredProvider{proxies: []C.Proxy{old, other}, version: 1}
+	group, err := NewURLTest(GroupCommonOption{Name: "auto", URL: "https://probe.invalid/"},
+		URLTestOption{Tolerance: 50}, old, []P.ProxyProvider{provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := group.fast(false); got != C.Proxy(old) {
+		t.Fatal("initial choice")
+	}
+	for _, name := range []string{"first", "second"} {
+		replacement := &measuredProxy{name: "current", delay: 0xffff, alive: true}
+		provider.proxies = []C.Proxy{replacement, other}
+		provider.version++
+		group.fastSingle.Reset()
+		if got := group.fast(false); got != C.Proxy(replacement) {
+			t.Fatalf("%s replacement: the group did not follow the new object", name)
+		}
+	}
+	other.delay = 120
+	group.fastSingle.Reset()
+	if got := group.Now(); got != "current" {
+		t.Fatalf("a node 20 ms slower than the carried score took over: %s", got)
+	}
+}
