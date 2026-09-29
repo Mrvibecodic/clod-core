@@ -167,9 +167,10 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 
 		// Find the current node in the whole list, the first place included:
 		// the same object if it is still there (a node of another provider
-		// with the same name must not take its place), otherwise the first
-		// object with its name — a provider update replaced it, and the old
-		// object gets no more checks.
+		// with the same name must not take its place), otherwise the object
+		// with its name from the same provider — a provider update replaced
+		// it, and the old object gets no more checks — or, failing that, the
+		// first object with its name.
 		var current C.Proxy
 		if u.fastNode != nil {
 			for _, proxy := range proxies {
@@ -179,8 +180,15 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 				}
 			}
 			if current == nil {
+				provider := u.fastNode.ProxyInfo().ProviderName
 				for _, proxy := range proxies {
-					if proxy.Name() == u.fastNode.Name() {
+					if proxy.Name() != u.fastNode.Name() {
+						continue
+					}
+					if current == nil {
+						current = proxy
+					}
+					if proxy.ProxyInfo().ProviderName == provider {
 						current = proxy
 						break
 					}

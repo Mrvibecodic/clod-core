@@ -10,10 +10,13 @@ import (
 
 type measuredProxy struct {
 	C.Proxy
-	name  string
-	delay uint16
-	alive bool
+	name     string
+	delay    uint16
+	alive    bool
+	provider string
 }
+
+func (p *measuredProxy) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{ProviderName: p.provider} }
 
 func (p *measuredProxy) Name() string                                   { return p.name }
 func (p *measuredProxy) AliveForTestUrl(string) bool                    { return p.alive }
