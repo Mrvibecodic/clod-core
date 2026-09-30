@@ -264,7 +264,7 @@ func alternateHosts(proxies []C.Proxy) []C.Proxy {
 	var hosts []string
 	byHost := map[string][]C.Proxy{}
 	for _, p := range proxies {
-		host := C.ProbeHost(p.Addr())
+		host := C.ProbeHostOf(p)
 		if _, ok := byHost[host]; !ok {
 			hosts = append(hosts, host)
 		}
@@ -396,16 +396,34 @@ func (r *probeRun) finished() bool {
 // startProbe waits for the probe's start slot (probes to one host are spaced
 // out) and then runs the probe in the background: the hedge timer of the
 // caller counts from the probe's own start, not from the wait for the slot.
-func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], hedge bool) *probeRun {
-	base, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+// first is the probe this one is the second of, nil for the first.
+func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], first *probeRun) *probeRun {
+	hedge := first != nil
+	deadline := time.Now().Add(hc.timeout)
+	if hedge {
+		// The second probe ends when it would after the default hedge delay,
+		// however late it starts: a probe takes at most ProbeHedgeDelay and a
+		// timeout.
+		deadline = first.started.Add(probeHedgeDelay + hc.timeout)
+	}
+	base, cancel := context.WithDeadline(hc.ctx, deadline)
 	if hedge {
 		// A caller that paced its probe paced the first one only.
 		base = C.UnmarkProbePaced(base)
 	}
 	run := &probeRun{result: &C.ProbeResult{}, done: make(chan struct{}), cancel: cancel}
-	pace := func() error { return C.ProbePace(base, C.ProbeHost(p.Addr())) }
+	pace := func(ctx context.Context) error { return C.ProbePace(ctx, C.ProbeHostOf(p)) }
 	if !hedge {
-		if err := pace(); err != nil {
+		paceCtx := base
+		if until, ok := hc.ctx.Deadline(); ok {
+			// A caller's deadline bounds the whole probe: the wait for a turn
+			// leaves it the hedge delay, a timeout and the grace, or a second
+			// probe failing at the deadline would be taken for a cancel.
+			var cancelPace context.CancelFunc
+			paceCtx, cancelPace = context.WithDeadline(base, until.Add(C.ProbeReserve-probeHedgeDelay-hc.timeout-probeHedgeGrace))
+			defer cancelPace()
+		}
+		if err := pace(paceCtx); err != nil {
 			// The check was cancelled while the probe waited for its turn:
 			// nothing ran, the result stays unheld.
 			run.started = time.Now()
@@ -421,7 +439,7 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 		// The second probe waits for its turn in the background: an answer to
 		// the first one that comes meanwhile is taken at once. A wait that is
 		// cut short leaves the result unheld.
-		if hedge && pace() != nil {
+		if hedge && pace(base) != nil {
 			return
 		}
 		_, _ = p.URLTest(ctx, url, expectedStatus)
@@ -483,20 +501,26 @@ func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRang
 // node is probed once at a time whichever groups ask.
 func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
 	// The second probe guards a live node against a false verdict; a dead
-	// node has none to lose. A live node known to answer slower than the
-	// hedge delay gets it only after a quick failure, or it would get two
-	// probes every round.
-	last := p.LastDelayForTestUrl(url)
+	// node has none to lose. A live node whose last probe took longer than
+	// the hedge delay (the whole probe: the timer counts the dial and the
+	// handshake, the unified delay only the last request) gets it at twice
+	// that time, or it would get two probes every round. Its second probe
+	// still ends by the hedge delay and a timeout, and is not started with
+	// less time than the last probe took.
 	alive := p.AliveForTestUrl(url)
-	slow := alive && last != 0xffff && time.Duration(last)*time.Millisecond >= probeHedgeDelay
-	first := hc.startProbe(p, url, expectedStatus, false)
+	hedgeAt, hedged := probeHedgeDelay, alive
+	if elapsed := recorder.LastProbeElapsed(url); alive && elapsed >= probeHedgeDelay {
+		hedgeAt = 2 * elapsed
+		hedged = probeHedgeDelay+hc.timeout-hedgeAt >= elapsed
+	}
+	first := hc.startProbe(p, url, expectedStatus, nil)
 	defer first.cancel()
 	// The hedge delay counts from the probe's own start, not from its wait
 	// for a turn to the host.
-	hedge := time.NewTimer(probeHedgeDelay)
+	hedge := time.NewTimer(hedgeAt)
 	defer hedge.Stop()
 	stalled := hedge.C
-	if !alive || slow {
+	if !hedged {
 		stalled = nil
 	}
 
@@ -535,7 +559,7 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 		return probeCancelled, nil
 	}
 
-	second := hc.startProbe(p, url, expectedStatus, true)
+	second := hc.startProbe(p, url, expectedStatus, first)
 	defer second.cancel()
 	// A closed channel is always ready: once a probe has reported, its channel
 	// is set aside so the select waits for the other one.

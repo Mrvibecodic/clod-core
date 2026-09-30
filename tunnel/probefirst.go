@@ -18,6 +18,31 @@ type currentNoder interface {
 
 func init() {
 	C.SetProbeFirst(currentNodes)
+	C.SetProbeHostOf(probeHostOf)
+}
+
+// probeHostOf follows a probe to its first handshake: a group dials its
+// current node, a node with dialer-proxy dials that proxy first. A group that
+// points nowhere or a dialer-proxy that does not exist has no host to space by.
+func probeHostOf(p C.Proxy) string {
+	for depth := 0; depth < 16 && p != nil; depth++ {
+		if g, ok := p.Adapter().(proxyGroup); ok {
+			nodes := appendCurrentNodes(nil, g)
+			if len(nodes) == 0 {
+				return ""
+			}
+			p = nodes[0]
+			continue
+		}
+		relay := p.ProxyInfo().DialerProxy
+		if relay == "" {
+			return C.ProbeHost(p.Addr())
+		}
+		configMux.RLock()
+		p = proxies[relay]
+		configMux.RUnlock()
+	}
+	return ""
 }
 
 // currentNodes are the nodes the groups point at right now, nested groups

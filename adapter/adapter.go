@@ -29,6 +29,9 @@ const (
 type internalProxyState struct {
 	alive   atomic.Bool
 	history *queue.Queue[C.DelayHistory]
+	// elapsed is how long the last probe took as a whole, dial and handshake
+	// included: the unified delay counts only its last request.
+	elapsed atomic.Int64
 }
 
 type Proxy struct {
@@ -170,7 +173,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 	// Probes to one host are spaced out, and the wait is not part of the
 	// measurement: the delay and the elapsed time start with the probe itself.
-	if err = C.ProbePace(ctx, C.ProbeHost(p.Addr())); err != nil {
+	if err = C.ProbePace(ctx, C.ProbeHostOf(p)); err != nil {
 		// The caller gave up while the probe was waiting for its turn: nothing
 		// was measured, so nothing is recorded.
 		if held := C.HeldProbe(ctx); held != nil {
@@ -202,7 +205,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 			}
 			return
 		}
-		p.recordURLTest(url, t, err, satisfied, time.Now())
+		p.recordURLTest(url, t, err, satisfied, time.Now(), time.Since(began))
 	}()
 
 	unifiedDelay := UnifiedDelay.Load()
@@ -293,7 +296,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 }
 
 // recordURLTest writes the outcome of a probe of url into the history.
-func (p *Proxy) recordURLTest(url string, t uint16, err error, satisfied bool, at time.Time) {
+func (p *Proxy) recordURLTest(url string, t uint16, err error, satisfied bool, at time.Time, elapsed time.Duration) {
 	alive := err == nil
 	record := C.DelayHistory{Time: at}
 	if alive {
@@ -311,12 +314,21 @@ func (p *Proxy) recordURLTest(url string, t uint16, err error, satisfied bool, a
 	}
 
 	state.alive.Store(alive)
+	state.elapsed.Store(int64(elapsed))
 	p.putHistory(state.history, record)
 }
 
 // RecordProbe implements C.ProbeRecorder
 func (p *Proxy) RecordProbe(url string, result *C.ProbeResult) {
-	p.recordURLTest(url, result.Delay, result.Err, result.Satisfied, result.Time)
+	p.recordURLTest(url, result.Delay, result.Err, result.Satisfied, result.Time, result.Elapsed)
+}
+
+// LastProbeElapsed implements C.ProbeRecorder
+func (p *Proxy) LastProbeElapsed(url string) time.Duration {
+	if state, ok := p.extra.Load(url); ok {
+		return time.Duration(state.elapsed.Load())
+	}
+	return 0
 }
 
 // RecordSoftFailure implements C.ProbeRecorder

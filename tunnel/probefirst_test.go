@@ -108,3 +108,39 @@ func TestCurrentNodesSkipGlobalOutsideGlobalMode(t *testing.T) {
 		t.Fatalf("GLOBAL not counted in global mode: %v", got)
 	}
 }
+
+// fakeServer is a node with a server address and maybe a dialer-proxy.
+type fakeServer struct {
+	fakeProxy
+	addr, relay string
+}
+
+func (s *fakeServer) Addr() string           { return s.addr }
+func (s *fakeServer) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{DialerProxy: s.relay} }
+
+func server(name, addr, relay string) C.Proxy {
+	return &fakeServer{fakeProxy: fakeProxy{name: name, adapter: &fakeNode{}}, addr: addr, relay: relay}
+}
+
+func TestAProbeIsSpacedByTheHostOfItsFirstHandshake(t *testing.T) {
+	relay := server("relay", "relay.example:443", "")
+	exit := server("exit", "exit.example:443", "relay")
+	lost := server("lost", "lost.example:443", "nowhere")
+	sel := group("Proxy", "exit", exit, relay)
+	UpdateProxies(map[string]C.Proxy{"relay": relay, "exit": exit, "Proxy": sel, "lost": lost}, nil)
+	defer UpdateProxies(map[string]C.Proxy{}, nil)
+
+	for _, tt := range []struct {
+		p    C.Proxy
+		want string
+	}{
+		{relay, "relay.example"},
+		{exit, "relay.example"},
+		{sel, "relay.example"},
+		{lost, ""},
+	} {
+		if got := C.ProbeHostOf(tt.p); got != tt.want {
+			t.Errorf("%s: host %q, want %q", tt.p.Name(), got, tt.want)
+		}
+	}
+}

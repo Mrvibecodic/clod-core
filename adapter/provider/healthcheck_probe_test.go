@@ -3,6 +3,7 @@ package provider
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -466,5 +467,145 @@ func TestASlowNodeThatStallsGetsOneProbe(t *testing.T) {
 	}
 	if got := target.connections() - before; got != 1 {
 		t.Fatalf("a slow node that stalled gets one probe, saw %d", got)
+	}
+}
+
+func TestASlowNodeThatStallsGetsALaterSecondProbe(t *testing.T) {
+	// The node's probes take longer than the hedge delay: its second probe
+	// comes at twice that time rather than never.
+	const slow = probeHedgeDelay + 200*time.Millisecond
+	target := newProbeTarget(t, slow, "slow", "slow", "stall", "ok")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
+		t.Fatalf("first round: %v", outcome)
+	}
+	before := target.connections()
+	began := time.Now()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeRecovered {
+		t.Fatalf("a slow node that stalled: %v, want recovered", outcome)
+	}
+	if elapsed := time.Since(began); elapsed < 2*slow-50*time.Millisecond || elapsed > 2*slow+500*time.Millisecond {
+		t.Fatalf("the second probe of a slow node comes at twice its last probe (%s), took %s", 2*slow, elapsed)
+	}
+	if got := target.connections() - before; got != 2 {
+		t.Fatalf("a slow node that stalled gets a second probe, saw %d", got)
+	}
+}
+
+func TestTheLaterSecondProbeEndsWithinTheHedgeAndTimeout(t *testing.T) {
+	const slow = probeHedgeDelay + 200*time.Millisecond
+	const timeout = 3000
+	target := newProbeTarget(t, slow, "slow", "slow", "stall", "stall")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), timeout, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
+		t.Fatalf("first round: %v", outcome)
+	}
+	before := target.connections()
+	began := time.Now()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeStalled {
+		t.Fatalf("a slow node whose probes stalled: %v, want stalled", outcome)
+	}
+	worst := probeHedgeDelay + timeout*time.Millisecond
+	if elapsed := time.Since(began); elapsed > worst+300*time.Millisecond || elapsed < worst-100*time.Millisecond {
+		t.Fatalf("the later second probe ends by hedge+timeout (%s), took %s", worst, elapsed)
+	}
+	if got := target.connections() - before; got != 2 {
+		t.Fatalf("two probes, saw %d", got)
+	}
+}
+
+// keepAliveTarget answers every request of a connection after pause and keeps
+// the connection: with unified-delay the recorded delay is the second request
+// only.
+func keepAliveTarget(t *testing.T, pause time.Duration) (string, func() int) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	conns := 0
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns++
+			mu.Unlock()
+			go func() {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				for {
+					if _, err := http.ReadRequest(reader); err != nil {
+						return
+					}
+					time.Sleep(pause)
+					if _, err := conn.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	return "http://" + listener.Addr().String() + "/generate_204", func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return conns
+	}
+}
+
+func TestAFarNodeWithUnifiedDelayGetsOneProbe(t *testing.T) {
+	// Each request takes 600 ms: the recorded delay is below the hedge delay,
+	// the whole probe above it.
+	adapter.UnifiedDelay.Store(true)
+	t.Cleanup(func() { adapter.UnifiedDelay.Store(false) })
+	url, conns := keepAliveTarget(t, 600*time.Millisecond)
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, url, 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	for round := 0; round < 3; round++ {
+		before := conns()
+		if outcome, _ := hc.probe(proxy, url, nil); outcome != probePassed {
+			t.Fatalf("round %d: %v", round, outcome)
+		}
+		if got := conns() - before; round > 0 && got != 1 {
+			t.Fatalf("round %d: delay %d ms, %d connections; a node whose probe takes longer than the hedge delay gets one", round, proxy.LastDelayForTestUrl(url), got)
+		}
+	}
+}
+
+func TestProbeNodeJudgesAStalledNodeWithinTheCallersDeadline(t *testing.T) {
+	// The host's turns are booked for 7 s ahead: the first probe must not
+	// wait so long that the second one runs past the caller's deadline and
+	// the verdict is lost.
+	target := newProbeTarget(t, 0, "stall", "stall")
+	node, _ := outbound.NewHttp(outbound.HttpOption{Name: "n", Server: "127.0.0.1", Port: target.port()})
+	proxy := adapter.NewProxy(node)
+	var booked sync.WaitGroup
+	for i := 0; i < 28; i++ {
+		booked.Add(1)
+		go func() {
+			defer booked.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_ = C.ProbePace(ctx, "127.0.0.1")
+		}()
+	}
+	t.Cleanup(booked.Wait)
+	time.Sleep(50 * time.Millisecond)
+	const attempt = 7 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), attempt+ProbeHedgeDelay+C.ProbeReserve)
+	defer cancel()
+	began := time.Now()
+	_, err := ProbeNode(ctx, proxy, target.url(), nil, attempt)
+	if ctx.Err() != nil || errors.Is(err, ErrProbeDiscarded) || proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("no verdict within the deadline: %v after %s, alive %t", err, time.Since(began), proxy.AliveForTestUrl(target.url()))
 	}
 }
