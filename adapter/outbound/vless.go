@@ -419,6 +419,9 @@ func (v *Vless) ResetNetwork() {
 	if v.gunClient != nil {
 		_ = v.gunClient.Close()
 	}
+	if v.xhttpClient != nil {
+		v.xhttpClient.ResetNetwork()
+	}
 }
 
 // Close implements C.ProxyAdapter
