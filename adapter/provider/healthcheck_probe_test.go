@@ -448,3 +448,23 @@ func TestAProbeThatWaitedForItsTurnIsNotHedgedAtOnce(t *testing.T) {
 		t.Fatalf("a node that answers within the delay gets one probe, saw %d", got)
 	}
 }
+
+func TestASlowNodeThatStallsGetsOneProbe(t *testing.T) {
+	// The Android build runs Go timers of 1.23 and later: Stop on a timer that
+	// fired unread still reports true. A slow node never reads its hedge timer,
+	// and its stalled probe must not be followed by a second one.
+	target := newProbeTarget(t, probeHedgeDelay+300*time.Millisecond, "slow", "slow", "stall", "ok")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 2000, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
+		t.Fatalf("first round: %v", outcome)
+	}
+	before := target.connections()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeFailed {
+		t.Fatalf("a slow node that stalled: %v, want failed", outcome)
+	}
+	if got := target.connections() - before; got != 1 {
+		t.Fatalf("a slow node that stalled gets one probe, saw %d", got)
+	}
+}
