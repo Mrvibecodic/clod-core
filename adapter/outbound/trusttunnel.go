@@ -79,6 +79,12 @@ func (t *TrustTunnel) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+// ResetNetwork closes the pooled connections of the network the device has
+// left; the pooled clients stay and dial new ones.
+func (t *TrustTunnel) ResetNetwork() {
+	t.client.ResetNetwork()
+}
+
 // Close implements C.ProxyAdapter
 func (t *TrustTunnel) Close() error {
 	return t.client.Close()

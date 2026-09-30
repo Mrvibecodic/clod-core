@@ -70,6 +70,15 @@ func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 	return &clientConn{Conn: conn, raw: raw}, nil
 }
 
+// ResetNetwork closes the connections of the network the device has left.
+// The client stays usable; Close would end it for good.
+func (c *Client) ResetNetwork() {
+	if rt, ok := c.rt.(*alpnAwareRoundTripper); ok {
+		httputils.CloseTransport(rt.h1)
+		httputils.CloseTransport(rt.h2)
+	}
+}
+
 func (c *Client) Close() error {
 	c.once.Do(func() {
 		c.cancel()

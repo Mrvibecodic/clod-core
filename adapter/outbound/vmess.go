@@ -455,6 +455,9 @@ func (v *Vmess) ResetNetwork() {
 	if v.gunClient != nil {
 		_ = v.gunClient.Close()
 	}
+	if v.mekyaClient != nil {
+		v.mekyaClient.ResetNetwork()
+	}
 }
 
 // Close implements C.ProxyAdapter

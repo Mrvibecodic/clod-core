@@ -331,6 +331,16 @@ func (c *PoolClient) ListenICMP(ctx context.Context) (*IcmpConn, error) {
 	return transport.ListenICMP(ctx)
 }
 
+// ResetNetwork closes the connections of every pooled client. Unlike Close it
+// keeps the clients, so their health check loops are not left behind.
+func (c *PoolClient) ResetNetwork() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for _, t := range c.clients {
+		t.ResetConnections()
+	}
+}
+
 func (c *PoolClient) Close() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
