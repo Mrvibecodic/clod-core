@@ -2,11 +2,13 @@ package route
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	C "github.com/metacubex/mihomo/constant"
@@ -122,11 +124,16 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 
 	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
+	// The probe of the scheduled check: a stalled probe gets a second one and
+	// a failure is confirmed before the node is marked dead. It may wait up to
+	// ProbeReserve for its turn to the host, then take the hedge delay and the
+	// timeout; the client waits for the timeout and five seconds.
+	attempt := time.Millisecond * time.Duration(timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), attempt+provider.ProbeHedgeDelay+C.ProbeReserve)
 	defer cancel()
 
-	delay, err := proxy.URLTest(ctx, url, expectedStatus)
-	if ctx.Err() != nil {
+	delay, err := provider.ProbeNode(ctx, proxy, url, expectedStatus, attempt)
+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, provider.ErrProbeDiscarded) {
 		render.Status(r, http.StatusGatewayTimeout)
 		render.JSON(w, r, ErrRequestTimeout)
 		return

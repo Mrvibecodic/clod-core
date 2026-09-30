@@ -67,6 +67,9 @@ type ProbeRecorder interface {
 	// the node dead: the failure is remembered, the verdict is left to the
 	// probe recorded after it.
 	RecordSoftFailure(url string, at time.Time)
+	// LastProbeElapsed is how long the last recorded probe of url took as a
+	// whole, 0 if there is none.
+	LastProbeElapsed(url string) time.Duration
 }
 
 type heldProbeKey struct{}

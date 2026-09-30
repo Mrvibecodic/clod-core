@@ -32,6 +32,24 @@ func ProbeHost(addr string) string {
 	return addr
 }
 
+var probeHostOf func(Proxy) string
+
+// SetProbeHostOf is set by the tunnel, which knows the groups and the proxies
+// named in dialer-proxy.
+func SetProbeHostOf(fn func(Proxy) string) {
+	probeHostOf = fn
+}
+
+// ProbeHostOf is the host the first handshake of a probe through p goes to,
+// the one a censor sees: a group's current node's, a dialer-proxy's, and only
+// then the node's own server. Probes are spaced out by it.
+func ProbeHostOf(p Proxy) string {
+	if probeHostOf != nil {
+		return probeHostOf(p)
+	}
+	return ProbeHost(p.Addr())
+}
+
 type probePacedKey struct{}
 
 // MarkProbePaced says that the caller has already waited for the probe's
