@@ -6,6 +6,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -29,6 +30,9 @@ func NewUid(oUid, adapter string) (*Uid, error) {
 	if len(uidRange) == 0 {
 		return nil, errPayload
 	}
+	if features.CMFA {
+		log.Warnln("[UID] rule UID,%s never matches on Android: use PROCESS-NAME with the app package name", oUid)
+	}
 	return &Uid{
 		Base:    Base{},
 		adapter: adapter,
@@ -42,6 +46,12 @@ func (u *Uid) RuleType() C.RuleType {
 }
 
 func (u *Uid) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
+	// clod: the Android client fills the package name, not the uid, so the
+	// rule cannot match there; it stays silent instead of looking the process
+	// up and logging a warning for every connection.
+	if features.CMFA {
+		return false, ""
+	}
 	if helper.FindProcess != nil {
 		helper.FindProcess()
 	}
