@@ -335,6 +335,28 @@ const ProbeHedgeDelay = probeHedgeDelay
 // only slower, not failed, and must not cost the node a failure in its history.
 const probeHedgeGrace = 250 * time.Millisecond
 
+// hedgeAt is when a live node whose last probe took elapsed gets its second
+// probe beside a first one that has not answered. A quick node gets it at the
+// hedge delay. A slow node (the whole probe counts: the dial and the
+// handshake, not only the unified delay) gets it at twice its usual time, so
+// that a normal answer comes before it and one probe a round is enough, but
+// never so late that the second probe has less than one and a half of that
+// time left: the probe as a whole still ends by the hedge delay and a timeout,
+// the budget callers of ProbeNode count on.
+func (hc *HealthCheck) hedgeAt(elapsed time.Duration) time.Duration {
+	if elapsed < probeHedgeDelay {
+		return probeHedgeDelay
+	}
+	at := 2 * elapsed
+	if latest := probeHedgeDelay + hc.timeout - elapsed*3/2; latest < at {
+		at = latest
+	}
+	if at < probeHedgeDelay {
+		at = probeHedgeDelay
+	}
+	return at
+}
+
 type probeOutcome int
 
 const (
@@ -343,7 +365,7 @@ const (
 	probePassed
 	probeRecovered // the first probe stalled, the second passed
 	probeStalled   // both probes failed
-	probeRefused   // failed with an answer: closed port, missing name, bad status
+	probeRefused   // failed with nothing to retry: the probe URL cannot be used
 	probeFailed    // failed with no second probe: the node was dead or is slow
 )
 
@@ -480,13 +502,13 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 	return run
 }
 
-// probe tests p and records the result. A probe that has not answered within
-// probeHedgeDelay, or failed in a way that may be a momentary stall, gets a
-// second probe started beside it: the node is alive if either answers, and the
-// stalled probe is kept in its history so url-test ranks the node below steady
-// ones. A failure that is an answer (closed port, missing name, unexpected
-// status) marks the node dead at once, and so do two failed probes. The result
-// returned is the recorded one that decided the outcome, nil if none was.
+// probe tests p and records the result. A live node whose probe has not
+// answered within the hedge delay, or failed, gets a second probe started
+// beside it: the node is alive if either answers, and the stalled probe is
+// kept in its history so url-test ranks the node below steady ones. Two failed
+// probes mark the node dead, a dead node is probed once, and a probe URL that
+// cannot be used is not retried. The result returned is the recorded one that
+// decided the outcome, nil if none was.
 func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
 	recorder, ok := p.(C.ProbeRecorder)
 	if !ok {
@@ -534,18 +556,9 @@ func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRang
 // node is probed once at a time whichever groups ask.
 func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
 	// The second probe guards a live node against a false verdict; a dead
-	// node has none to lose. A live node whose last probe took longer than
-	// the hedge delay (the whole probe: the timer counts the dial and the
-	// handshake, the unified delay only the last request) gets it at twice
-	// that time, or it would get two probes every round. Its second probe
-	// still ends by the hedge delay and a timeout, and is not started with
-	// less time than the last probe took.
+	// node has none to lose, and every live node gets it, the slow ones too.
 	alive := p.AliveForTestUrl(url)
-	hedgeAt, hedged := probeHedgeDelay, alive
-	if elapsed := recorder.LastProbeElapsed(url); alive && elapsed >= probeHedgeDelay {
-		hedgeAt = 2 * elapsed
-		hedged = probeHedgeDelay+hc.timeout-hedgeAt >= elapsed
-	}
+	hedgeAt := hc.hedgeAt(recorder.LastProbeElapsed(url))
 	first := hc.startProbe(p, url, expectedStatus, nil)
 	defer first.cancel()
 	// The hedge delay counts from the probe's own start, not from its wait
@@ -553,7 +566,7 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 	hedge := time.NewTimer(hedgeAt)
 	defer hedge.Stop()
 	stalled := hedge.C
-	if !hedged {
+	if !alive {
 		stalled = nil
 	}
 
@@ -566,11 +579,8 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 			recorder.RecordProbe(url, first.result)
 			return probePassed, first.result
 		}
-		// Elapsed time, not Stop: with the timers of Go 1.23 and later, Stop on
-		// a timer that fired unread still reports true.
-		if !first.result.Retryable() || !alive || time.Since(first.started) >= probeHedgeDelay {
-			// An answer, a dead node, or a failure that took the whole hedge
-			// delay (a slow node's): no second probe.
+		if !first.result.Retryable() || !alive {
+			// An unusable probe URL or a dead node: no second probe.
 			log.Debugln("[Проба] %s: не отвечает (%s)", p.Name(), first.result)
 			recorder.RecordProbe(url, first.result)
 			if !first.result.Retryable() {
@@ -580,12 +590,18 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 		}
 		// A quick failure that may be a lost packet: the second probe still
 		// waits out the hedge delay rather than repeating the failure at once.
-		hedge.Stop()
-		hedge.Reset(probeHedgeDelay - time.Since(first.started))
-		select {
-		case <-hedge.C:
-		case <-hc.ctx.Done():
-			return probeCancelled, nil
+		// A failure after it (a slow node's, before its later hedge) gets the
+		// second probe at once. Elapsed time, not Stop: with the timers of
+		// Go 1.23 and later, Stop on a timer that fired unread still reports
+		// true.
+		if wait := probeHedgeDelay - time.Since(first.started); wait > 0 {
+			hedge.Stop()
+			hedge.Reset(wait)
+			select {
+			case <-hedge.C:
+			case <-hc.ctx.Done():
+				return probeCancelled, nil
+			}
 		}
 	case <-stalled:
 	case <-hc.ctx.Done():

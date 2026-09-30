@@ -35,6 +35,11 @@ type GroupBase struct {
 	testTimeout       int
 	maxFailedTimes    int
 	emptyFallback     C.Proxy
+	// reviveNext is when a dial through a node marked dead may start the next
+	// check, reviveWait the pause after it; see onDeadNodeDialed.
+	reviveMux  sync.Mutex
+	reviveNext time.Time
+	reviveWait time.Duration
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex
@@ -334,6 +339,50 @@ func (gb *GroupBase) healthCheck() {
 	gb.failedTimes = 0
 	gb.failedTestMux.Unlock()
 	gb.failedTesting.Store(false)
+}
+
+const (
+	reviveFirstWait = 30 * time.Second
+	reviveMaxWait   = 10 * time.Minute
+)
+
+// onDeadNodeDialed is told of a connection through p that worked. A group
+// dials a node marked dead only when none of its nodes is alive, and a check
+// that ran while the network was gone leaves them so until the next interval:
+// a connection that works shows the network is back, and the group is
+// checked at once. The next such check waits reviveFirstWait; a check that
+// leaves p dead doubles the wait, up to reviveMaxWait, so that a node that
+// carries traffic but fails its probes does not have the group probed over
+// and over.
+func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
+	if p.AliveForTestUrl(testUrl) {
+		return
+	}
+	gb.reviveMux.Lock()
+	now := time.Now()
+	if now.Before(gb.reviveNext) {
+		gb.reviveMux.Unlock()
+		return
+	}
+	if gb.reviveWait == 0 {
+		gb.reviveWait = reviveFirstWait
+	}
+	// No second check starts while this one runs.
+	gb.reviveNext = now.Add(reviveMaxWait)
+	gb.reviveMux.Unlock()
+
+	log.Infoln("[Проба] %s: соединение через %s прошло, а узел помечен мёртвым — группа перепроверяется", gb.Name(), p.Name())
+	go func() {
+		fn()
+		gb.reviveMux.Lock()
+		defer gb.reviveMux.Unlock()
+		if p.AliveForTestUrl(testUrl) {
+			gb.reviveWait = reviveFirstWait
+		} else if gb.reviveWait *= 2; gb.reviveWait > reviveMaxWait {
+			gb.reviveWait = reviveMaxWait
+		}
+		gb.reviveNext = time.Now().Add(gb.reviveWait)
+	}()
 }
 
 func (gb *GroupBase) onDialSuccess() {

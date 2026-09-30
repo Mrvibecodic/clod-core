@@ -29,10 +29,6 @@ type ProbeResult struct {
 	Status    int
 	Stage     string
 	Elapsed   time.Duration
-	// Answered is set by URLTest when the error is a definite answer from the
-	// network rather than a stall: the node's port is closed or its name does
-	// not resolve.
-	Answered bool
 }
 
 // OK reports whether the probe counts as a live node.
@@ -40,14 +36,13 @@ func (r *ProbeResult) OK() bool {
 	return r.Held && r.Err == nil && r.Satisfied
 }
 
-// Retryable reports whether a failed probe may have been a momentary stall
-// worth a second look. A closed port, a name that does not exist or an
-// unexpected status code are answers, not stalls: asking again only hides them.
+// Retryable reports whether a failed probe is worth a second look. Every
+// failure on the way to the node or through it is: a closed port, a name that
+// does not resolve or an odd status code also come from a network that is
+// switching or waking up. Only a probe URL that cannot be used at all says
+// nothing that a second probe could change.
 func (r *ProbeResult) Retryable() bool {
-	if r.Stage == ProbeStageStatus || r.Stage == ProbeStageAddress || r.Err == nil {
-		return false
-	}
-	return !r.Answered
+	return !r.OK() && r.Stage != ProbeStageAddress
 }
 
 func (r *ProbeResult) String() string {

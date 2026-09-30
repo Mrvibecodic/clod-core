@@ -81,10 +81,13 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
 			if err == nil {
 				u.onDialSuccess()
+				u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck)
 			} else {
 				u.onDialFailed(proxy.Type(), err, u.healthCheck)
 			}
 		})
+	} else if err == nil {
+		u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck)
 	}
 
 	return c, err

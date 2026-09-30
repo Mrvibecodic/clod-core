@@ -43,10 +43,13 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
 			if err == nil {
 				f.onDialSuccess()
+				f.onDeadNodeDialed(proxy, f.testUrl, f.healthCheck)
 			} else {
 				f.onDialFailed(proxy.Type(), err, f.healthCheck)
 			}
 		})
+	} else if err == nil {
+		f.onDeadNodeDialed(proxy, f.testUrl, f.healthCheck)
 	}
 
 	return c, err
