@@ -321,6 +321,11 @@ func (p *Proxy) RecordProbe(url string, result *C.ProbeResult) {
 
 // RecordSoftFailure implements C.ProbeRecorder
 func (p *Proxy) RecordSoftFailure(url string, at time.Time) {
+	// A probe that hung while the network was switching says nothing about
+	// the node, as with a failed one.
+	if C.ProbeHolding(at) || C.ProbeHolding(time.Now()) {
+		return
+	}
 	record := C.DelayHistory{Time: at}
 	p.putHistory(p.history, record)
 	p.putHistory(p.stateForTestUrl(url).history, record)
