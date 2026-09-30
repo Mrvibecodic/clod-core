@@ -139,6 +139,14 @@ func aliveProxy(proxies []C.Proxy, selected, testUrl string) (proxy C.Proxy, sel
 			return proxy, selectedDown
 		}
 	}
+	if selected != "" {
+		// The selected node is not in the list: a provider update dropped it,
+		// or the selection came back from the cache for a node that is gone.
+		// The group works as if nothing were selected and keeps the selection
+		// for the node's return.
+		proxy, _ := aliveProxy(proxies, "", testUrl)
+		return proxy, false
+	}
 
 	return proxies[0], selectedDown
 }

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
-	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -30,17 +29,21 @@ type extraOption struct {
 }
 
 type HealthCheck struct {
-	ctx            context.Context
-	ctxCancel      context.CancelFunc
-	url            string
-	extra          map[string]*extraOption
-	mu             sync.Mutex
-	proxies        []C.Proxy
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+	url       string
+	extra     map[string]*extraOption
+	mu        sync.Mutex
+	proxies   []C.Proxy
+	// replaced says the list changed since a round last took it; round is
+	// closed when the running round ends, nil while none runs.
+	replaced       bool
+	round          chan struct{}
+	roundEnd       time.Time
 	interval       time.Duration
 	lazy           bool
 	expectedStatus utils.IntRanges[uint16]
 	lastTouch      atomic.TypedValue[time.Time]
-	singleDo       *singledo.Single[struct{}]
 	timeout        time.Duration
 }
 
@@ -67,16 +70,16 @@ func (hc *HealthCheck) process() {
 func (hc *HealthCheck) setProxies(proxies []C.Proxy) {
 	hc.mu.Lock()
 	hc.proxies = proxies
+	hc.replaced = true
 	hc.mu.Unlock()
 }
 
-// snapshotProxies reads the list under the lock: a provider update replaces it
-// while a round may be starting, and an unsynchronised read of a slice header
-// can pair the new array with the old length.
-func (hc *HealthCheck) snapshotProxies() []C.Proxy {
+// listReplaced reports that the running round's list is no longer the
+// provider's: the nodes left in it have been replaced and are not probed.
+func (hc *HealthCheck) listReplaced() bool {
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
-	return hc.proxies
+	return hc.replaced
 }
 
 func (hc *HealthCheck) registerHealthCheckTask(url string, expectedStatus utils.IntRanges[uint16], filter string, interval uint) {
@@ -134,49 +137,75 @@ func (hc *HealthCheck) touch() {
 	hc.lastTouch.Store(time.Now())
 }
 
+// check runs a round over the nodes, or waits for the one running. A list
+// replaced by a provider update meanwhile is taken by that round before it
+// ends, so the new nodes are probed without waiting for the next interval. A
+// round that ended less than a second ago stands for a new one, unless the
+// list changed since.
 func (hc *HealthCheck) check() {
-	if len(hc.snapshotProxies()) == 0 {
+	hc.mu.Lock()
+	if done := hc.round; done != nil {
+		hc.mu.Unlock()
+		<-done
 		return
 	}
-
-	_, _, _ = hc.singleDo.Do(func() (struct{}, error) {
-		proxies, head := C.ProbeFirstOrder(hc.snapshotProxies())
-		id := utils.NewUUIDV4().String()
-		log.Debugln("Start New Health Checking {%s}", id)
-		b := new(errgroup.Group)
-		b.SetLimit(10)
-
-		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
-		tally := &probeTally{down: map[string]string{}}
-		// The nodes the groups use go first on every URL: a group with a URL of
-		// its own (an extra one) ranks its nodes by that URL, not the provider's.
-		// They book their turns to their hosts before the rest is started, or
-		// a node of the same host started later could take the first turn.
-		booked := &sync.WaitGroup{}
-		for _, part := range [][]C.Proxy{proxies[:head], proxies[head:]} {
-			part = alternateHosts(part)
-
-			// execute default health check
-			hc.execute(b, part, hc.url, id, option, tally, booked)
-
-			// execute extra health check
-			for url, option := range hc.extra {
-				hc.execute(b, part, url, id, option, tally, booked)
-			}
-			if booked != nil {
-				booked.Wait()
-				booked = nil
-			}
+	if len(hc.proxies) == 0 || (!hc.replaced && time.Since(hc.roundEnd) < time.Second) {
+		hc.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	hc.round = done
+	for len(hc.proxies) > 0 && hc.ctx.Err() == nil {
+		proxies := hc.proxies
+		hc.replaced = false
+		hc.mu.Unlock()
+		hc.runRound(proxies)
+		hc.mu.Lock()
+		if !hc.replaced {
+			break
 		}
-		_ = b.Wait()
-		if stalls := tally.recovered.Load() + tally.stalled.Load(); stalls > 1 {
-			log.Warnln("[Проба] за проверку первая проба зависла или оборвалась у %d из %d узлов: повторная прошла у %d, не прошла у %d",
-				stalls, tally.total.Load(), tally.recovered.Load(), tally.stalled.Load())
+	}
+	hc.round, hc.roundEnd = nil, time.Now()
+	hc.mu.Unlock()
+	close(done)
+}
+
+func (hc *HealthCheck) runRound(all []C.Proxy) {
+	proxies, head := C.ProbeFirstOrder(all)
+	id := utils.NewUUIDV4().String()
+	log.Debugln("Start New Health Checking {%s}", id)
+	b := new(errgroup.Group)
+	b.SetLimit(10)
+
+	option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
+	tally := &probeTally{down: map[string]string{}}
+	// The nodes the groups use go first on every URL: a group with a URL of
+	// its own (an extra one) ranks its nodes by that URL, not the provider's.
+	// They book their turns to their hosts before the rest is started, or
+	// a node of the same host started later could take the first turn.
+	booked := &sync.WaitGroup{}
+	for _, part := range [][]C.Proxy{proxies[:head], proxies[head:]} {
+		part = alternateHosts(part)
+
+		// execute default health check
+		hc.execute(b, part, hc.url, id, option, tally, booked)
+
+		// execute extra health check
+		for url, option := range hc.extra {
+			hc.execute(b, part, url, id, option, tally, booked)
 		}
-		tally.reportDown(len(proxies))
-		log.Debugln("Finish A Health Checking {%s}", id)
-		return struct{}{}, nil
-	})
+		if booked != nil {
+			booked.Wait()
+			booked = nil
+		}
+	}
+	_ = b.Wait()
+	if stalls := tally.recovered.Load() + tally.stalled.Load(); stalls > 1 {
+		log.Warnln("[Проба] за проверку первая проба зависла или оборвалась у %d из %d узлов: повторная прошла у %d, не прошла у %d",
+			stalls, tally.total.Load(), tally.recovered.Load(), tally.stalled.Load())
+	}
+	tally.reportDown(len(proxies))
+	log.Debugln("Finish A Health Checking {%s}", id)
 }
 
 func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption, tally *probeTally, booked *sync.WaitGroup) {
@@ -221,6 +250,10 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 		}
 		b.Go(func() error {
 			defer release()
+			if hc.listReplaced() {
+				// The round takes the new list next.
+				return nil
+			}
 			probeHC.checkOne(p, url, uid, expectedStatus, tally)
 			return nil
 		})
@@ -689,6 +722,5 @@ func NewHealthCheck(proxies []C.Proxy, url string, timeout uint, interval uint, 
 		interval:       time.Duration(interval) * time.Second,
 		lazy:           lazy,
 		expectedStatus: expectedStatus,
-		singleDo:       singledo.NewSingle[struct{}](time.Second),
 	}
 }
