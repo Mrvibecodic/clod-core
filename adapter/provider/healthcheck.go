@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -197,7 +198,7 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 		p := proxy
 		b.Go(func() error {
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
-			outcome := hc.probe(p, url, expectedStatus)
+			outcome, _ := hc.probe(p, url, expectedStatus)
 			if outcome == probeCancelled || outcome == probeShared {
 				return nil
 			}
@@ -220,6 +221,16 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 // within one timeout after it. The worst case for a node is thus
 // probeHedgeDelay + timeout, not two timeouts.
 const probeHedgeDelay = time.Second
+
+// ProbeHedgeDelay is probeHedgeDelay for callers of ProbeNode that budget a
+// probe: it may take ProbeHedgeDelay plus its timeout.
+const ProbeHedgeDelay = probeHedgeDelay
+
+// probeHedgeGrace is how long the first probe still gets once the second one
+// has answered. A lost connect packet is resent about when the second probe
+// starts, and then both answer at nearly the same moment: the first one is
+// only slower, not failed, and must not cost the node a failure in its history.
+const probeHedgeGrace = 250 * time.Millisecond
 
 type probeOutcome int
 
@@ -251,6 +262,7 @@ var probeFlights = struct {
 type probeFlight struct {
 	done    chan struct{}
 	outcome probeOutcome
+	result  *C.ProbeResult
 }
 
 func probeFlightKey(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) string {
@@ -277,8 +289,12 @@ func (r *probeRun) finished() bool {
 // startProbe waits for the probe's start slot (probes to one host are spaced
 // out) and then runs the probe in the background: the hedge timer of the
 // caller counts from the probe's own start, not from the wait for the slot.
-func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) *probeRun {
+func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], hedge bool) *probeRun {
 	ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+	if hedge {
+		// A caller that paced its probe paced the first one only.
+		ctx = C.UnmarkProbePaced(ctx)
+	}
 	run := &probeRun{result: &C.ProbeResult{}, done: make(chan struct{}), cancel: cancel}
 	if err := C.ProbePace(ctx, C.ProbeHost(p.Addr())); err != nil {
 		// The check was cancelled while the probe waited for its turn:
@@ -303,44 +319,53 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 // second probe started beside it: the node is alive if either answers, and the
 // stalled probe is kept in its history so url-test ranks the node below steady
 // ones. A failure that is an answer (closed port, missing name, unexpected
-// status) marks the node dead at once, and so do two failed probes.
-func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) probeOutcome {
+// status) marks the node dead at once, and so do two failed probes. The result
+// returned is the recorded one that decided the outcome, nil if none was.
+func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
 	recorder, ok := p.(C.ProbeRecorder)
 	if !ok {
 		ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 		defer cancel()
 		_, _ = p.URLTest(ctx, url, expectedStatus)
-		return probePassed
+		return probePassed, nil
 	}
 
 	key := probeFlightKey(p, url, expectedStatus)
-	probeFlights.Lock()
-	if flight, running := probeFlights.m[key]; running {
+	for {
+		probeFlights.Lock()
+		flight, running := probeFlights.m[key]
+		if !running {
+			break
+		}
 		probeFlights.Unlock()
 		select {
 		case <-flight.done:
-			log.Debugln("[Проба] %s: проба уже шла у другой группы, взят её результат", p.Name())
-			return probeShared
 		case <-hc.ctx.Done():
-			return probeCancelled
+			return probeCancelled, nil
+		}
+		// A probe cancelled with its own caller (another check, a client's
+		// round) found nothing out: this one probes the node itself.
+		if flight.outcome != probeCancelled {
+			log.Debugln("[Проба] %s: проба уже шла у другой группы, взят её результат", p.Name())
+			return probeShared, flight.result
 		}
 	}
 	flight := &probeFlight{done: make(chan struct{})}
 	probeFlights.m[key] = flight
 	probeFlights.Unlock()
-	outcome := hc.probeOnce(p, recorder, url, expectedStatus)
+	outcome, result := hc.probeOnce(p, recorder, url, expectedStatus)
 	probeFlights.Lock()
 	delete(probeFlights.m, key)
 	probeFlights.Unlock()
-	flight.outcome = outcome
+	flight.outcome, flight.result = outcome, result
 	close(flight.done)
-	return outcome
+	return outcome, result
 }
 
 // probeOnce is the probe itself, with the hedge; probe wraps it so that one
 // node is probed once at a time whichever groups ask.
-func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16]) probeOutcome {
-	first := hc.startProbe(p, url, expectedStatus)
+func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
+	first := hc.startProbe(p, url, expectedStatus, false)
 	defer first.cancel()
 	hedge := time.NewTimer(probeHedgeDelay)
 	defer hedge.Stop()
@@ -348,73 +373,135 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 	select {
 	case <-first.done:
 		if hc.ctx.Err() != nil || !first.result.Held {
-			return probeCancelled
+			return probeCancelled, nil
 		}
 		if first.result.OK() {
 			recorder.RecordProbe(url, first.result)
-			return probePassed
+			return probePassed, first.result
 		}
 		if !first.result.Retryable() {
+			logProbeFailure(p, url, "[Проба] %s: не отвечает (%s)", p.Name(), first.result)
 			recorder.RecordProbe(url, first.result)
-			log.Warnln("[Проба] %s: не отвечает (%s)", p.Name(), first.result)
-			return probeRefused
+			return probeRefused, first.result
 		}
 		// A quick failure that may be a lost packet: the second probe still
 		// waits out the hedge delay rather than repeating the failure at once.
 		select {
 		case <-hedge.C:
 		case <-hc.ctx.Done():
-			return probeCancelled
+			return probeCancelled, nil
 		}
 	case <-hedge.C:
 	case <-hc.ctx.Done():
-		return probeCancelled
+		return probeCancelled, nil
 	}
 
-	second := hc.startProbe(p, url, expectedStatus)
+	second := hc.startProbe(p, url, expectedStatus, true)
 	defer second.cancel()
 	// A closed channel is always ready: once a probe has reported, its channel
 	// is set aside so the select waits for the other one.
 	firstDone, secondDone := first.done, second.done
+	var grace <-chan time.Time
+	graceOver := false
 	for {
 		select {
 		case <-firstDone:
 			firstDone = nil
 		case <-secondDone:
 			secondDone = nil
+		case <-grace:
+			grace, graceOver = nil, true
 		case <-hc.ctx.Done():
-			return probeCancelled
+			return probeCancelled, nil
 		}
 		if hc.ctx.Err() != nil {
-			return probeCancelled
+			return probeCancelled, nil
 		}
 		if first.finished() && first.result.Held && first.result.OK() {
 			// The node answered its own probe, only slower than the hedge;
 			// the second probe is dropped, its outcome decides nothing.
 			recorder.RecordProbe(url, first.result)
-			return probePassed
+			return probePassed, first.result
 		}
 		if second.finished() && second.result.Held && second.result.OK() {
+			if !first.finished() && !graceOver {
+				if grace == nil {
+					timer := time.NewTimer(probeHedgeGrace)
+					defer timer.Stop()
+					grace = timer.C
+				}
+				continue
+			}
 			recorder.RecordSoftFailure(url, first.started)
 			recorder.RecordProbe(url, second.result)
-			log.Warnln("[Проба] %s: первая проба не ответила за %d мс, повторная прошла: %s",
+			log.Debugln("[Проба] %s: первая проба не ответила за %d мс, повторная прошла: %s",
 				p.Name(), time.Since(first.started).Milliseconds(), second.result)
-			return probeRecovered
+			return probeRecovered, second.result
 		}
 		if first.finished() && second.finished() {
 			if !first.result.Held || !second.result.Held {
-				return probeCancelled
+				return probeCancelled, nil
 			}
+			logProbeFailure(p, url, "[Проба] %s: не отвечает (%s), повторная проба тоже (%s)", p.Name(), first.result, second.result)
 			recorder.RecordProbe(url, first.result)
 			recorder.RecordProbe(url, second.result)
-			log.Warnln("[Проба] %s: не отвечает (%s), повторная проба тоже (%s)", p.Name(), first.result, second.result)
 			if !second.result.Retryable() {
-				return probeRefused
+				return probeRefused, second.result
 			}
-			return probeStalled
+			return probeStalled, second.result
 		}
 	}
 }
+
+// logProbeFailure writes a failed probe as a warning only when it takes a live
+// node down: a node that stays dead fails every round, and a warning per dead
+// node per round buries the events in the log.
+func logProbeFailure(p C.Proxy, url, format string, args ...any) {
+	if p.AliveForTestUrl(url) {
+		log.Warnln(format, args...)
+	} else {
+		log.Debugln(format, args...)
+	}
+}
+
+// ProbeNode probes p the way the scheduled health check does: a second probe
+// beside a stalled first one, a failure confirmed before the node is marked
+// dead, one probe per node at a time shared with any check already probing
+// it. ctx bounds the whole probe, timeout each of its (at most two) attempts,
+// so it may take ProbeHedgeDelay plus timeout. A probe that found nothing out
+// (ctx ended, the network was switching) returns ctx's error or
+// ErrProbeDiscarded and records nothing.
+func ProbeNode(ctx context.Context, p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], timeout time.Duration) (uint16, error) {
+	// The probe needs only a context and a timeout from its health check.
+	outcome, result := (&HealthCheck{ctx: ctx, timeout: timeout}).probe(p, url, expectedStatus)
+	switch {
+	case outcome == probeCancelled:
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return 0, ErrProbeDiscarded
+	case result == nil:
+		// A node that cannot hold its probe results was recorded directly.
+		if p.AliveForTestUrl(url) {
+			return p.LastDelayForTestUrl(url), nil
+		}
+		return 0, errProbeFailed
+	case result.OK():
+		return result.Delay, nil
+	case result.Err != nil:
+		return 0, result.Err
+	default:
+		return 0, fmt.Errorf("%w: %d", errUnexpectedStatus, result.Status)
+	}
+}
+
+var (
+	// ErrProbeDiscarded is a probe whose result says nothing about the node:
+	// it ran while the network was switching or the process was paused.
+	ErrProbeDiscarded   = errors.New("probe discarded")
+	errProbeFailed      = errors.New("probe failed")
+	errUnexpectedStatus = errors.New("unexpected status code")
+)
 
 func (hc *HealthCheck) close() {
 	hc.ctxCancel()
