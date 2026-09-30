@@ -121,3 +121,27 @@ func TestURLTestFollowsTheReplacementFromTheSameProvider(t *testing.T) {
 		t.Fatal("the group moved to X of another provider instead of the replacement")
 	}
 }
+
+// A node removed by its provider is not replaced by a namesake from another
+// provider: that is another server, and the choice is made afresh.
+func TestURLTestRemovedNodeIsNotReplacedByANamesake(t *testing.T) {
+	xa := &measuredProxy{name: "X", delay: 100, alive: true, provider: "A"}
+	za := &measuredProxy{name: "Z", delay: 250, alive: true, provider: "A"}
+	xb := &measuredProxy{name: "X", delay: 300, alive: true, provider: "B"}
+	a := &measuredProvider{proxies: []C.Proxy{xa, za}, version: 1}
+	b := &measuredProvider{proxies: []C.Proxy{xb}, version: 1}
+	group, err := NewURLTest(GroupCommonOption{Name: "auto", URL: "https://probe.invalid/"},
+		URLTestOption{Tolerance: 50}, xa, []P.ProxyProvider{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := group.fast(false); got != C.Proxy(xa) {
+		t.Fatal("initial choice is not X of A")
+	}
+	a.proxies = []C.Proxy{za}
+	a.version++
+	group.fastSingle.Reset()
+	if got := group.fast(false); got != C.Proxy(za) {
+		t.Fatalf("after X of A was removed the group chose %v, want the fresh best Z", got.Name())
+	}
+}
