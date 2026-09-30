@@ -115,30 +115,16 @@ func TestURLTestProviderReplacement(t *testing.T) {
 	}
 }
 
-func TestURLTestPendingProviderHealth(t *testing.T) {
+// A replacement the provider did not hand the old checks to (the server
+// changed under the same name) is another server: it does not hold the group.
+func TestURLTestUncheckedReplacementDoesNotHoldTheGroup(t *testing.T) {
 	candidate := &urlTestProxy{name: "candidate", alive: true, delay: 100}
 	old := &urlTestProxy{name: "current", alive: true, delay: 1000}
-	// New proxies are alive before their first check, but have no delay history.
 	current := &urlTestProxy{name: old.name, alive: true, delay: 0xffff}
 	provider := &urlTestProvider{proxies: []C.Proxy{candidate, current}, version: 1}
 	group := newURLTestForTest(provider, old, 1500)
-	if got := group.fast(false); got != current {
-		t.Fatal("pending check did not retain the replacement proxy")
-	}
-	// Also exercise subsequent selections before the first check completes.
-	group.fastSingle.Reset()
-	if got := group.fast(false); got != current {
-		t.Fatal("pending check was treated as an excessive delay")
-	}
-	current.delay = 1000
-	group.fastSingle.Reset()
-	if got := group.fast(false); got != current {
-		t.Fatal("completed healthy check ignored tolerance")
-	}
-	current.alive = false
-	group.fastSingle.Reset()
 	if got := group.fast(false); got != candidate {
-		t.Fatal("completed failed check did not trigger failover")
+		t.Fatal("an unchecked replacement held the group")
 	}
 }
 

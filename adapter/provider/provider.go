@@ -103,11 +103,37 @@ func (bp *baseProvider) RegisterHealthCheckTask(url string, expectedStatus utils
 func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.mutex.Lock()
 	defer bp.mutex.Unlock()
+	inheritState(bp.proxies, proxies)
 	bp.proxies = proxies
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
 	if bp.healthCheck.auto() {
 		go bp.healthCheck.check()
+	}
+}
+
+// inheritState hands what the checks know of a node to the object that
+// replaces it: an update of the subscription parses every node anew, and the
+// nodes it kept would start unchecked and alive, so a fallback group took a
+// dead first node for alive until its next check. A node is kept if its name,
+// type and server are the same; a node whose server changed under the same
+// name is another server and starts afresh.
+func inheritState(old, fresh []C.Proxy) {
+	if len(old) == 0 {
+		return
+	}
+	byName := make(map[string]C.Proxy, len(old))
+	for _, p := range old {
+		byName[p.Name()] = p
+	}
+	for _, p := range fresh {
+		prev, ok := byName[p.Name()]
+		if !ok || prev.Type() != p.Type() || prev.Addr() != p.Addr() {
+			continue
+		}
+		if heir, ok := p.(interface{ Inherit(C.Proxy) }); ok {
+			heir.Inherit(prev)
+		}
 	}
 }
 

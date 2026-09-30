@@ -67,36 +67,6 @@ func TestURLTestKeepsTheSameObjectAmongNamesakes(t *testing.T) {
 	}
 }
 
-// A node replaced twice before its first check keeps competing with the
-// score of the last measured object.
-func TestURLTestCarriesTheScoreThroughTwoReplacements(t *testing.T) {
-	old := &measuredProxy{name: "current", delay: 100, alive: true}
-	other := &measuredProxy{name: "other", delay: 0xffff, alive: true}
-	provider := &measuredProvider{proxies: []C.Proxy{old, other}, version: 1}
-	group, err := NewURLTest(GroupCommonOption{Name: "auto", URL: "https://probe.invalid/"},
-		URLTestOption{Tolerance: 50}, old, []P.ProxyProvider{provider})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := group.fast(false); got != C.Proxy(old) {
-		t.Fatal("initial choice")
-	}
-	for _, name := range []string{"first", "second"} {
-		replacement := &measuredProxy{name: "current", delay: 0xffff, alive: true}
-		provider.proxies = []C.Proxy{replacement, other}
-		provider.version++
-		group.fastSingle.Reset()
-		if got := group.fast(false); got != C.Proxy(replacement) {
-			t.Fatalf("%s replacement: the group did not follow the new object", name)
-		}
-	}
-	other.delay = 120
-	group.fastSingle.Reset()
-	if got := group.Now(); got != "current" {
-		t.Fatalf("a node 20 ms slower than the carried score took over: %s", got)
-	}
-}
-
 // After one provider replaces the current node, the group follows that
 // provider's new object, not a namesake from another provider.
 func TestURLTestFollowsTheReplacementFromTheSameProvider(t *testing.T) {
@@ -113,7 +83,9 @@ func TestURLTestFollowsTheReplacementFromTheSameProvider(t *testing.T) {
 	if got := group.fast(false); got != C.Proxy(xb) {
 		t.Fatal("initial choice is not X of B")
 	}
-	nb := &measuredProxy{name: "X", delay: 0xffff, alive: true, provider: "B"}
+	// The provider hands the new object the old one's checks.
+	nb := &measuredProxy{name: "X", delay: 100, alive: true, provider: "B"}
+	xa.delay = 80
 	b.proxies = []C.Proxy{nb}
 	b.version++
 	group.fastSingle.Reset()

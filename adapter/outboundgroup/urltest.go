@@ -29,11 +29,6 @@ type URLTest struct {
 	disableUDP     bool
 	fastNode       C.Proxy
 	fastSingle     *singledo.Single[C.Proxy]
-	// carried is the object that replaced the current node on a provider
-	// update, and carriedScore the old object's score: the new object has no
-	// checks yet and competes with the old one's result until its first one.
-	carried      C.Proxy
-	carriedScore uint32
 	// fastMu serialises the choice: a Reset of fastSingle while a choice is
 	// being made lets a second one start alongside the first.
 	fastMu sync.Mutex
@@ -177,9 +172,9 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 
 		// Find the current node in the whole list, the first place included:
 		// the same object if it is still there, otherwise the object with its
-		// name from the same provider — a provider update replaced it, and the
-		// old object gets no more checks. A namesake from another provider is
-		// another server: if the node is gone, the choice is made afresh.
+		// name from the same provider — a provider update replaced it and
+		// handed it the old object's checks. A namesake from another provider
+		// is another server: if the node is gone, the choice is made afresh.
 		var current C.Proxy
 		if u.fastNode != nil {
 			for _, proxy := range proxies {
@@ -194,15 +189,6 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 					if proxy.Name() == u.fastNode.Name() && proxy.ProxyInfo().ProviderName == provider {
 						current = proxy
 						break
-					}
-				}
-				if current != nil {
-					if u.fastNode.LastDelayForTestUrl(u.testUrl) != 0xffff {
-						u.carried, u.carriedScore = current, u.score(u.fastNode)
-					} else if u.fastNode == u.carried {
-						// Replaced again before its first check: the old
-						// score goes on to the newest object.
-						u.carried = current
 					}
 				}
 			}
@@ -228,16 +214,8 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		}
 		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) {
 			u.fastNode = fast
-		} else {
-			current := u.score(u.fastNode)
-			if u.fastNode == u.carried && u.fastNode.LastDelayForTestUrl(u.testUrl) == 0xffff {
-				current = u.carriedScore
-			} else {
-				u.carried = nil
-			}
-			if current > minScore+uint32(u.tolerance) {
-				u.fastNode = fast
-			}
+		} else if u.score(u.fastNode) > minScore+uint32(u.tolerance) {
+			u.fastNode = fast
 		}
 		return u.fastNode, nil
 	})

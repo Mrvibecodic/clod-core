@@ -343,6 +343,32 @@ func (p *Proxy) RecordSoftFailure(url string, at time.Time) {
 	p.putHistory(p.stateForTestUrl(url).history, record)
 }
 
+// Inherit takes over what the checks know of old: a provider update replaces
+// the objects of the nodes it keeps, and the new ones would start unchecked
+// and alive. The state is copied: a probe of old still in flight stays with
+// old.
+func (p *Proxy) Inherit(old C.Proxy) {
+	o, ok := old.(*Proxy)
+	if !ok {
+		return
+	}
+	p.alive.Store(o.alive.Load())
+	p.copyHistory(p.history, o.history)
+	o.extra.Range(func(url string, state *internalProxyState) bool {
+		copied := p.stateForTestUrl(url)
+		copied.alive.Store(state.alive.Load())
+		copied.elapsed.Store(state.elapsed.Load())
+		p.copyHistory(copied.history, state.history)
+		return true
+	})
+}
+
+func (p *Proxy) copyHistory(dst, src *queue.Queue[C.DelayHistory]) {
+	for _, record := range src.Copy() {
+		p.putHistory(dst, record)
+	}
+}
+
 func (p *Proxy) stateForTestUrl(url string) *internalProxyState {
 	state, _ := p.extra.LoadOrStoreFn(url, func() *internalProxyState {
 		return &internalProxyState{

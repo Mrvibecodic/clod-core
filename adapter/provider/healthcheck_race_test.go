@@ -2,6 +2,7 @@ package provider
 
 import (
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
@@ -30,4 +31,37 @@ func TestHealthCheckProxiesCanBeReplacedDuringARound(t *testing.T) {
 		hc.check()
 	}
 	<-replaced
+}
+
+// A provider update while a round runs: the round takes the new list before
+// it ends, the new nodes are not left for the next interval.
+func TestNodesOfAnUpdateDuringARoundAreProbed(t *testing.T) {
+	target := newProbeTarget(t, 0, "stall", "stall")
+	stale := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{stale}, target.url(), 2000, 0, false, nil)
+	t.Cleanup(hc.close)
+	go hc.check()
+	time.Sleep(300 * time.Millisecond)
+	fresh := adapter.NewProxy(outbound.NewDirect())
+	hc.setProxies([]C.Proxy{fresh})
+	hc.check()
+	if len(fresh.DelayHistoryForTestUrl(target.url())) == 0 {
+		t.Fatal("the node of the update was not probed")
+	}
+}
+
+// A provider update right after a round is probed at once, not answered with
+// the round just ended.
+func TestNodesOfAnUpdateRightAfterARoundAreProbed(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	first := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{first}, target.url(), 2000, 0, false, nil)
+	t.Cleanup(hc.close)
+	hc.check()
+	fresh := adapter.NewProxy(outbound.NewDirect())
+	hc.setProxies([]C.Proxy{fresh})
+	hc.check()
+	if len(fresh.DelayHistoryForTestUrl(target.url())) == 0 {
+		t.Fatal("the node of the update was not probed")
+	}
 }
