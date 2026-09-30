@@ -164,6 +164,15 @@ func (u *CoreUpdater) Update(currentExePath string, channel string, force bool) 
 		return fmt.Errorf("unpacking: %w", err)
 	}
 
+	// Clod: the new core must start on this machine before it replaces the
+	// running one: nothing brings the old one back once it is replaced, and a
+	// build that cannot run here (CPU, OS version, a damaged download) left
+	// the service restarting a dead core.
+	err = u.probeCore(updateExePath)
+	if err != nil {
+		return fmt.Errorf("checking the new core: %w", err)
+	}
+
 	err = u.backup(currentExePath, backupExePath, backupDir)
 	if err != nil {
 		return fmt.Errorf("backuping: %w", err)
@@ -291,6 +300,21 @@ func (u *CoreUpdater) backup(currentExePath, backupExePath, backupDir string) (e
 		return err
 	}
 
+	return nil
+}
+
+// probeCore runs the unpacked core with -v: it prints its version and exits
+// before reading any configuration.
+func (u *CoreUpdater) probeCore(exePath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, exePath, "-v").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if !strings.HasPrefix(string(out), "Mihomo Meta ") {
+		return fmt.Errorf("unexpected output: %q", strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 
