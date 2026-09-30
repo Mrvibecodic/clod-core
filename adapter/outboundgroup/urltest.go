@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/singledo"
@@ -21,7 +22,7 @@ type URLTestOption struct {
 
 type URLTest struct {
 	*GroupBase
-	selected       string
+	selected       atomic.TypedValue[string]
 	testUrl        string
 	expectedStatus string
 	tolerance      uint16
@@ -67,7 +68,7 @@ func (u *URLTest) Set(name string) error {
 }
 
 func (u *URLTest) ForceSet(name string) {
-	u.selected = name
+	u.selected.Store(name)
 	u.fastSingle.Reset()
 }
 
@@ -162,12 +163,12 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		u.fastMu.Lock()
 		defer u.fastMu.Unlock()
 		proxies := u.GetProxies(touch)
-		if u.selected != "" {
+		if selected := u.selected.Load(); selected != "" {
 			for _, proxy := range proxies {
 				if !proxy.AliveForTestUrl(u.testUrl) {
 					continue
 				}
-				if proxy.Name() == u.selected {
+				if proxy.Name() == selected {
 					u.fastNode = proxy
 					return proxy, nil
 				}
@@ -272,7 +273,7 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
-		"fixed":          u.selected,
+		"fixed":          u.selected.Load(),
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),
