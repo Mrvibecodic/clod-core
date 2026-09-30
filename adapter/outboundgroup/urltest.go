@@ -42,6 +42,15 @@ func (u *URLTest) Now() string {
 	return u.fast(false).Name()
 }
 
+// CurrentNode is the node the group is using, without making a new choice:
+// a choice is cached for ten seconds, and one made at the start of a check
+// would hide that check's own results from the first dial after it.
+func (u *URLTest) CurrentNode() C.Proxy {
+	u.fastMu.Lock()
+	defer u.fastMu.Unlock()
+	return u.fastNode
+}
+
 func (u *URLTest) Set(name string) error {
 	var p C.Proxy
 	for _, proxy := range u.GetProxies(false) {

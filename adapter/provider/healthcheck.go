@@ -138,7 +138,7 @@ func (hc *HealthCheck) check() {
 	}
 
 	_, _, _ = hc.singleDo.Do(func() (struct{}, error) {
-		proxies := hc.snapshotProxies()
+		proxies := C.ProbeFirstOrder(hc.snapshotProxies())
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)

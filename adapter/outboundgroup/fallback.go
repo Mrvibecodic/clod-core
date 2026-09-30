@@ -103,24 +103,41 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
-	proxies := f.GetProxies(touch)
+	proxy, selectedDown := aliveProxy(f.GetProxies(touch), f.selected, f.testUrl)
+	if selectedDown {
+		f.selected = ""
+	}
+	return proxy
+}
+
+// CurrentNode is the node the group would dial now. Unlike a dial, it does
+// not drop a selection whose node is down.
+func (f *Fallback) CurrentNode() C.Proxy {
+	proxy, _ := aliveProxy(f.GetProxies(false), f.selected, f.testUrl)
+	return proxy
+}
+
+// aliveProxy is the selected node if it is alive, else the first alive node
+// after it; the first node when none is alive. selectedDown reports that the
+// selection was passed over.
+func aliveProxy(proxies []C.Proxy, selected, testUrl string) (proxy C.Proxy, selectedDown bool) {
 	for _, proxy := range proxies {
-		if len(f.selected) == 0 {
-			if proxy.AliveForTestUrl(f.testUrl) {
-				return proxy
+		if selected != "" {
+			if proxy.Name() != selected {
+				continue
 			}
-		} else {
-			if proxy.Name() == f.selected {
-				if proxy.AliveForTestUrl(f.testUrl) {
-					return proxy
-				} else {
-					f.selected = ""
-				}
+			if proxy.AliveForTestUrl(testUrl) {
+				return proxy, false
 			}
+			selected, selectedDown = "", true
+			continue
+		}
+		if proxy.AliveForTestUrl(testUrl) {
+			return proxy, selectedDown
 		}
 	}
 
-	return proxies[0]
+	return proxies[0], selectedDown
 }
 
 func (f *Fallback) Set(name string) error {
