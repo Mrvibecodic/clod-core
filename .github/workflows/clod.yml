@@ -1,8 +1,6 @@
 name: Clod Core
 
 # Сборка ядра Clod: проверка на каждый пуш в main/android и релиз по тегу core-v*.
-# Upstream-workflow (build/test/trigger-cmfa-update) срабатывают только на ветку
-# Alpha и теги v*, поэтому здесь теги называются core-v…, а не v…
 
 on:
   workflow_dispatch:
