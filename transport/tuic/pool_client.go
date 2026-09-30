@@ -120,18 +120,24 @@ func (t *PoolClient) getClient(udp bool) Client {
 }
 
 func (t *PoolClient) ResetNetwork() {
-	closeAll := func(clients *list.List[Client], clientsMutex *sync.Mutex) {
+	var stale []Client
+	detach := func(clients *list.List[Client], clientsMutex *sync.Mutex) {
 		clientsMutex.Lock()
 		defer clientsMutex.Unlock()
 		for it := clients.Front(); it != nil; it = it.Next() {
 			if it.Value != nil {
-				it.Value.Close()
+				stale = append(stale, it.Value)
 			}
 		}
 		clients.Init()
 	}
-	closeAll(&t.tcpClients, &t.tcpClientsMutex)
-	closeAll(&t.udpClients, &t.udpClientsMutex)
+	detach(&t.tcpClients, &t.tcpClientsMutex)
+	detach(&t.udpClients, &t.udpClientsMutex)
+	// Closing a client waits for a handshake it has in progress; new dials
+	// get a fresh client meanwhile instead of waiting with it.
+	for _, client := range stale {
+		client.Close()
+	}
 }
 
 func NewPoolClientV4(clientOption *ClientOptionV4, dialFn DialFunc) *PoolClient {
