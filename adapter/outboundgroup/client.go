@@ -41,8 +41,8 @@ func (s *Selector) TestOptions() (string, string) {
 	return s.testUrl, s.expectedStatus
 }
 
-func (f *Fallback) Pinned() string { return f.selected }
-func (u *URLTest) Pinned() string  { return u.selected }
+func (f *Fallback) Pinned() string { return f.selected.Load() }
+func (u *URLTest) Pinned() string  { return u.selected.Load() }
 
 // ResetChoice drops the cached choice, so that probes recorded outside the
 // group's own check (the client's) decide the next dial, not a choice made

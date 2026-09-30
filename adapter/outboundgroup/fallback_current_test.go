@@ -18,21 +18,21 @@ func TestFallbackCurrentNodeKeepsADownSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group.selected = "B"
+	group.selected.Store("B")
 
 	if got := group.CurrentNode(); got != C.Proxy(c) {
 		t.Fatalf("current node with the selection down = %v, want the next alive node C", got)
 	}
-	if group.selected != "B" {
-		t.Fatalf("reading the current node dropped the selection: %q", group.selected)
+	if group.selected.Load() != "B" {
+		t.Fatalf("reading the current node dropped the selection: %q", group.selected.Load())
 	}
 
-	if got := group.findAliveProxy(false); got != C.Proxy(c) || group.selected != "" {
-		t.Fatalf("a dial keeps passing over the down selection and drops it: %v, %q", got, group.selected)
+	if got := group.findAliveProxy(false); got != C.Proxy(c) || group.selected.Load() != "" {
+		t.Fatalf("a dial keeps passing over the down selection and drops it: %v, %q", got, group.selected.Load())
 	}
 
 	b.alive = true
-	group.selected = "B"
+	group.selected.Store("B")
 	if got := group.CurrentNode(); got != C.Proxy(b) {
 		t.Fatalf("current node with the selection alive = %v, want B", got)
 	}
