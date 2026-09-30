@@ -25,6 +25,7 @@ type probeTarget struct {
 	mu       sync.Mutex
 	held     []net.Conn
 	conns    int
+	firstAt  time.Time
 }
 
 func newProbeTarget(t *testing.T, slow time.Duration, plan ...string) *probeTarget {
@@ -61,6 +62,9 @@ func (pt *probeTarget) serve() {
 		}
 		pt.mu.Lock()
 		n := pt.conns
+		if n == 0 {
+			pt.firstAt = time.Now()
+		}
 		pt.conns++
 		action := "ok"
 		if n < len(pt.plan) {
@@ -171,8 +175,8 @@ func TestTwoStalledProbesCostOneTimeoutPlusTheHedge(t *testing.T) {
 	if elapsed < worst-100*time.Millisecond {
 		t.Fatalf("the second probe must get its full timeout (%s), took %s", worst, elapsed)
 	}
-	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 2 {
-		t.Fatalf("both failed probes belong in the history: %v", history)
+	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 1 {
+		t.Fatalf("one outage, one failure in the history: %v", history)
 	}
 }
 
@@ -331,5 +335,116 @@ func TestTheHedgeWaitingForItsTurnDoesNotHoldBackTheFirstAnswer(t *testing.T) {
 	}
 	if elapsed := time.Since(began); elapsed > probeHedgeDelay+700*time.Millisecond {
 		t.Fatalf("the answer waited for the second probe's turn: %s", elapsed)
+	}
+}
+
+func TestADeadNodeGetsOneProbe(t *testing.T) {
+	// A second probe guards a live node; a dead one has no verdict to lose.
+	target := newProbeTarget(t, 0, "stall", "stall", "stall", "stall")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 500, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeStalled {
+		t.Fatalf("first round: %v", outcome)
+	}
+	began := time.Now()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeFailed {
+		t.Fatalf("second round: %v", outcome)
+	}
+	if elapsed := time.Since(began); elapsed >= probeHedgeDelay {
+		t.Fatalf("a dead node must be judged within its timeout: %s", elapsed)
+	}
+	if got := target.connections(); got != 3 {
+		t.Fatalf("two probes for the live node, one for the dead: saw %d", got)
+	}
+}
+
+func TestANodeKnownToBeSlowGetsOneProbe(t *testing.T) {
+	target := newProbeTarget(t, probeHedgeDelay+300*time.Millisecond, "slow", "slow", "slow")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 3000, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
+		t.Fatalf("first round: %v", outcome)
+	}
+	before := target.connections()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
+		t.Fatalf("second round: %v", outcome)
+	}
+	if got := target.connections() - before; got != 1 {
+		t.Fatalf("a node slower than the hedge delay gets one probe a round, saw %d", got)
+	}
+}
+
+func TestAlternateHostsSpreadsTheNodesOfOneHost(t *testing.T) {
+	var proxies []C.Proxy
+	for i, host := range []string{"10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2", "10.0.0.3"} {
+		node, err := outbound.NewHttp(outbound.HttpOption{Name: fmt.Sprintf("%d", i), Server: host, Port: 443})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxies = append(proxies, adapter.NewProxy(node))
+	}
+	got := ""
+	for _, p := range alternateHosts(proxies) {
+		got += p.Name()
+	}
+	if got != "035142" {
+		t.Fatalf("order %s, want 035142", got)
+	}
+}
+
+func TestTheCurrentNodeIsProbedBeforeTheOtherNodesOfItsHost(t *testing.T) {
+	// Six nodes on one host, the group uses the last one: its probe takes the
+	// first turn to the host, whichever probe the scheduler runs first.
+	var proxies []C.Proxy
+	var targets []*probeTarget
+	for i := 0; i < 6; i++ {
+		target := newProbeTarget(t, 0)
+		node, err := outbound.NewHttp(outbound.HttpOption{Name: fmt.Sprintf("host-%d", i), Server: "127.0.0.1", Port: target.port()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets = append(targets, target)
+		proxies = append(proxies, adapter.NewProxy(node))
+	}
+	current := proxies[5]
+	C.SetProbeFirst(func() []C.Proxy { return []C.Proxy{current} })
+	t.Cleanup(func() { C.SetProbeFirst(nil) })
+	hc := NewHealthCheck(proxies, targets[0].url(), 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	hc.check()
+	for i, target := range targets[:5] {
+		if !targets[5].firstAt.Before(target.firstAt) {
+			t.Fatalf("node %d was probed before the current node", i)
+		}
+	}
+}
+
+func TestAProbeThatWaitedForItsTurnIsNotHedgedAtOnce(t *testing.T) {
+	// The hedge delay counts from the probe's start: a first probe that
+	// waited more than the delay for its turn to the host still gets it.
+	target := newProbeTarget(t, 300*time.Millisecond, "slow", "slow")
+	node, _ := outbound.NewHttp(outbound.HttpOption{Name: "queued", Server: "127.0.0.1", Port: target.port()})
+	proxy := adapter.NewProxy(node)
+	var booked sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		booked.Add(1)
+		go func() {
+			defer booked.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = C.ProbePace(ctx, "127.0.0.1")
+		}()
+	}
+	t.Cleanup(booked.Wait)
+	time.Sleep(50 * time.Millisecond)
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
+		t.Fatalf("outcome %v", outcome)
+	}
+	if got := target.connections(); got != 1 {
+		t.Fatalf("a node that answers within the delay gets one probe, saw %d", got)
 	}
 }
