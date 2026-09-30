@@ -46,6 +46,23 @@ func UnmarkProbePaced(ctx context.Context) context.Context {
 	return context.WithValue(ctx, probePacedKey{}, nil)
 }
 
+type probeBookedKey struct{}
+
+// WithProbeBooked makes ProbePace call booked once the probe has booked its
+// start slot, before it waits for it: a round starts the probes that must
+// queue behind this one only then.
+func WithProbeBooked(ctx context.Context, booked func()) context.Context {
+	return context.WithValue(ctx, probeBookedKey{}, booked)
+}
+
+// ProbeBooked tells the caller of WithProbeBooked that the probe needs no
+// turn of its own.
+func ProbeBooked(ctx context.Context) {
+	if booked, ok := ctx.Value(probeBookedKey{}).(func()); ok {
+		booked()
+	}
+}
+
 var probePacer = struct {
 	sync.Mutex
 	next map[string]time.Time
@@ -57,6 +74,7 @@ var probePacer = struct {
 // host is not paced.
 func ProbePace(ctx context.Context, host string) error {
 	if host == "" || ctx.Value(probePacedKey{}) != nil {
+		ProbeBooked(ctx)
 		return nil
 	}
 	limit := time.Duration(-1)
@@ -66,6 +84,7 @@ func ProbePace(ctx context.Context, host string) error {
 		}
 	}
 	wait := reserveProbeStart(host, time.Now(), limit)
+	ProbeBooked(ctx)
 	if wait <= 0 {
 		return nil
 	}
