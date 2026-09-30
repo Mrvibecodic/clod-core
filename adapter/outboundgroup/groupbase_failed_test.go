@@ -68,3 +68,42 @@ func TestGroupFailuresDuringACheckDoNotStartAnother(t *testing.T) {
 		t.Fatalf("checks started = %d, want 1", got)
 	}
 }
+
+// Once a check has ended, fresh failures count again from zero and start the
+// next check when they reach the limit.
+func TestGroupFreshFailuresAfterACheckStartTheNext(t *testing.T) {
+	provider := &blockingProvider{release: make(chan struct{})}
+	close(provider.release)
+	gb := NewGroupBase(GroupBaseOption{
+		Name:           "auto",
+		TestTimeout:    60000,
+		MaxFailedTimes: 3,
+		Providers:      []P.ProxyProvider{provider},
+	})
+	failure := errors.New("dial failed")
+	waitChecks := func(want int32, within time.Duration) int32 {
+		deadline := time.Now().Add(within)
+		for provider.checks.Load() < want && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		return provider.checks.Load()
+	}
+
+	for i := 0; i < 3; i++ {
+		gb.onDialFailed(C.Vless, failure, gb.healthCheck)
+	}
+	if got := waitChecks(1, 2*time.Second); got != 1 {
+		t.Fatalf("checks after the first run of failures = %d, want 1", got)
+	}
+	for i := 0; i < 2; i++ {
+		gb.onDialFailed(C.Vless, failure, gb.healthCheck)
+	}
+	if got := waitChecks(2, 200*time.Millisecond); got != 1 {
+		t.Fatalf("two fresh failures below the limit started a check: %d", got)
+	}
+	gb.onDialFailed(C.Vless, failure, gb.healthCheck)
+	if got := waitChecks(2, 2*time.Second); got != 2 {
+		t.Fatalf("the third fresh failure did not start the next check: %d", got)
+	}
+}
