@@ -147,7 +147,7 @@ func (hc *HealthCheck) check() {
 		b.SetLimit(10)
 
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
-		tally := &probeTally{down: map[string]struct{}{}}
+		tally := &probeTally{down: map[string]string{}}
 		// The nodes the groups use go first on every URL: a group with a URL of
 		// its own (an extra one) ranks its nodes by that URL, not the provider's.
 		// They book their turns to their hosts before the rest is started, or
@@ -173,7 +173,7 @@ func (hc *HealthCheck) check() {
 			log.Warnln("[Проба] за проверку первая проба зависла или оборвалась у %d из %d узлов: повторная прошла у %d, не прошла у %d",
 				stalls, tally.total.Load(), tally.recovered.Load(), tally.stalled.Load())
 		}
-		tally.reportDown()
+		tally.reportDown(len(proxies))
 		log.Debugln("Finish A Health Checking {%s}", id)
 		return struct{}{}, nil
 	})
@@ -233,7 +233,7 @@ func (hc *HealthCheck) checkOne(p C.Proxy, url, uid string, expectedStatus utils
 	// A node that was already dead stalls every round: it says nothing
 	// about the local side, which is what the round's count is about.
 	wasAlive := p.AliveForTestUrl(url)
-	outcome, _ := hc.probe(p, url, expectedStatus)
+	outcome, result := hc.probe(p, url, expectedStatus)
 	if outcome == probeCancelled || outcome == probeShared {
 		return
 	}
@@ -247,7 +247,7 @@ func (hc *HealthCheck) checkOne(p C.Proxy, url, uid string, expectedStatus utils
 		}
 	}
 	if wasAlive && !p.AliveForTestUrl(url) {
-		tally.noteDown(p.Name())
+		tally.noteDown(p.Name(), result)
 	}
 	log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
 }
@@ -323,16 +323,16 @@ type probeTally struct {
 	// down are the nodes the round took down, reported in one line: when the
 	// network is gone every node goes down, and a line per node buries the log.
 	mu   sync.Mutex
-	down map[string]struct{}
+	down map[string]string // node name: why its probe failed
 }
 
-func (t *probeTally) noteDown(name string) {
+func (t *probeTally) noteDown(name string, result *C.ProbeResult) {
 	t.mu.Lock()
-	t.down[name] = struct{}{}
+	t.down[name] = probeReason(result)
 	t.mu.Unlock()
 }
 
-func (t *probeTally) reportDown() {
+func (t *probeTally) reportDown(nodes int) {
 	if len(t.down) == 0 {
 		return
 	}
@@ -341,10 +341,20 @@ func (t *probeTally) reportDown() {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	for i, name := range names {
+		names[i] = name + " (" + t.down[name] + ")"
+	}
 	if len(names) > 5 {
 		names = append(names[:5], fmt.Sprintf("и ещё %d", len(names)-5))
 	}
-	log.Warnln("[Проба] перестали отвечать %d из %d узлов: %s", len(t.down), t.total.Load(), strings.Join(names, ", "))
+	log.Warnln("[Проба] перестали отвечать %d из %d узлов: %s", len(t.down), nodes, strings.Join(names, ", "))
+}
+
+func probeReason(result *C.ProbeResult) string {
+	if result == nil {
+		return "нет ответа"
+	}
+	return result.String()
 }
 
 // probeFlights are the node probes in progress, by node, URL and expected
@@ -499,7 +509,9 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 			recorder.RecordProbe(url, first.result)
 			return probePassed, first.result
 		}
-		if !first.result.Retryable() || !alive || !hedge.Stop() {
+		// Elapsed time, not Stop: with the timers of Go 1.23 and later, Stop on
+		// a timer that fired unread still reports true.
+		if !first.result.Retryable() || !alive || time.Since(first.started) >= probeHedgeDelay {
 			// An answer, a dead node, or a failure that took the whole hedge
 			// delay (a slow node's): no second probe.
 			log.Debugln("[Проба] %s: не отвечает (%s)", p.Name(), first.result)
@@ -511,6 +523,7 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 		}
 		// A quick failure that may be a lost packet: the second probe still
 		// waits out the hedge delay rather than repeating the failure at once.
+		hedge.Stop()
 		hedge.Reset(probeHedgeDelay - time.Since(first.started))
 		select {
 		case <-hedge.C:
@@ -592,8 +605,13 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 // (ctx ended, the network was switching) returns ctx's error or
 // ErrProbeDiscarded and records nothing.
 func ProbeNode(ctx context.Context, p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], timeout time.Duration) (uint16, error) {
+	wasAlive := p.AliveForTestUrl(url)
 	// The probe needs only a context and a timeout from its health check.
 	outcome, result := (&HealthCheck{ctx: ctx, timeout: timeout}).probe(p, url, expectedStatus)
+	if wasAlive && outcome != probeCancelled && outcome != probeShared && !p.AliveForTestUrl(url) {
+		// A caller's round has no summary of its own in the core log.
+		log.Warnln("[Проба] %s: перестал отвечать (%s)", p.Name(), probeReason(result))
+	}
 	switch {
 	case outcome == probeCancelled:
 		if err := ctx.Err(); err != nil {
