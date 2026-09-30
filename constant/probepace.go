@@ -40,6 +40,12 @@ func MarkProbePaced(ctx context.Context) context.Context {
 	return context.WithValue(ctx, probePacedKey{}, struct{}{})
 }
 
+// UnmarkProbePaced undoes MarkProbePaced: a second probe started beside one
+// the caller has paced waits for a start slot of its own.
+func UnmarkProbePaced(ctx context.Context) context.Context {
+	return context.WithValue(ctx, probePacedKey{}, nil)
+}
+
 var probePacer = struct {
 	sync.Mutex
 	next map[string]time.Time

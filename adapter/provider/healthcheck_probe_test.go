@@ -115,7 +115,7 @@ func probeOnce(t *testing.T, target *probeTarget, timeout uint) (probeOutcome, t
 	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), timeout, 0, false, nil)
 	t.Cleanup(hc.close)
 	began := time.Now()
-	outcome := hc.probe(proxy, target.url(), nil)
+	outcome, _ := hc.probe(proxy, target.url(), nil)
 	return outcome, time.Since(began), proxy
 }
 
@@ -189,6 +189,19 @@ func TestASlowAnswerToTheFirstProbeWins(t *testing.T) {
 	}
 }
 
+func TestAFirstProbeJustSlowerThanTheSecondIsNotAFailure(t *testing.T) {
+	// A connect packet resent at about the hedge: the first probe answers
+	// right after the second one, and the node has not failed anything.
+	target := newProbeTarget(t, probeHedgeDelay+probeHedgeGrace/2, "slow", "ok")
+	outcome, _, proxy := probeOnce(t, target, 3000)
+	if outcome != probePassed || !proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("outcome %v, alive %v", outcome, proxy.AliveForTestUrl(target.url()))
+	}
+	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 1 || history[0] == 0 {
+		t.Fatalf("a slower first answer is no failure: %v", history)
+	}
+}
+
 func TestAClosedPortIsNotHedged(t *testing.T) {
 	target := newProbeTarget(t, 0)
 	target.close()
@@ -212,7 +225,10 @@ func TestANodeInTwoGroupsIsProbedOnce(t *testing.T) {
 	outcomes := make(chan probeOutcome, 2)
 	for _, hc := range []*HealthCheck{first, second} {
 		hc := hc
-		go func() { outcomes <- hc.probe(proxy, target.url(), nil) }()
+		go func() {
+			outcome, _ := hc.probe(proxy, target.url(), nil)
+			outcomes <- outcome
+		}()
 	}
 	got := map[probeOutcome]int{}
 	for i := 0; i < 2; i++ {
