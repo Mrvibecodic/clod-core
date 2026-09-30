@@ -13,12 +13,14 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 )
 
 // probeTarget answers probe connections by a plan, one entry per connection
 // in the order they arrive: "ok" answers 204 at once, "slow" answers 204
-// after a pause, "stall" never answers.
+// after a pause, "drop" closes the connection after the pause, "bad" answers
+// 503 at once, "stall" never answers.
 type probeTarget struct {
 	listener net.Listener
 	plan     []string
@@ -97,11 +99,18 @@ func (pt *probeTarget) serve() {
 			// Loopback answers within a millisecond, which URLTest rounds to a
 			// delay of 0 — the value that means "failed"; a real node is slower.
 			pause := 2 * time.Millisecond
-			if action == "slow" {
+			if action == "slow" || action == "drop" {
 				pause = pt.slow
 			}
 			time.Sleep(pause)
-			_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			switch action {
+			case "drop":
+				return
+			case "bad":
+				_, _ = conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			default:
+				_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			}
 		}()
 	}
 }
@@ -208,15 +217,34 @@ func TestAFirstProbeJustSlowerThanTheSecondIsNotAFailure(t *testing.T) {
 	}
 }
 
-func TestAClosedPortIsNotHedged(t *testing.T) {
+func TestAClosedPortIsConfirmedByASecondProbe(t *testing.T) {
+	// A closed port on a live node may be a network switching or waking up:
+	// the node is dead only once the second probe finds it closed too.
 	target := newProbeTarget(t, 0)
 	target.close()
 	outcome, elapsed, proxy := probeOnce(t, target, 1000)
-	if outcome != probeRefused || proxy.AliveForTestUrl(target.url()) {
+	if outcome != probeStalled || proxy.AliveForTestUrl(target.url()) {
 		t.Fatalf("outcome %v, alive %v", outcome, proxy.AliveForTestUrl(target.url()))
 	}
-	if elapsed >= probeHedgeDelay {
-		t.Fatalf("a refused connection is an answer, no second probe: %s", elapsed)
+	if elapsed < probeHedgeDelay || elapsed > probeHedgeDelay+500*time.Millisecond {
+		t.Fatalf("the second probe comes at the hedge delay: %s", elapsed)
+	}
+	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 1 {
+		t.Fatalf("one outage, one failure in the history: %v", history)
+	}
+}
+
+func TestAnOddStatusIsConfirmedByASecondProbe(t *testing.T) {
+	target := newProbeTarget(t, 0, "bad", "ok")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 1000, 0, false, nil)
+	t.Cleanup(hc.close)
+	expected, err := utils.NewUnsignedRanges[uint16]("204")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome, _ := hc.probe(proxy, target.url(), expected); outcome != probeRecovered || !proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("outcome %v, alive %v", outcome, proxy.AliveForTestUrl(target.url()))
 	}
 }
 
@@ -280,12 +308,12 @@ func TestProbesToOneHostDoNotBurst(t *testing.T) {
 	}
 }
 
-func TestAPacedProbeOfAClosedPortIsStillNotHedged(t *testing.T) {
+func TestPacedProbesOfAClosedPortLeaveOneFailureEach(t *testing.T) {
 	target := newProbeTarget(t, 0)
 	target.close()
-	// Eight nodes on one closed port: the last waits for its slot longer than
-	// the hedge delay, then gets its answer at once — the hedge must count
-	// from the probe's start, not from the wait, or the node is probed twice.
+	// Eight nodes on one closed port: their probes and second probes wait for
+	// their turns to the host, and each node still ends the round dead with
+	// one failure in its history.
 	const nodes = 8
 	proxies := make([]C.Proxy, 0, nodes)
 	for i := 0; i < nodes; i++ {
@@ -304,7 +332,10 @@ func TestAPacedProbeOfAClosedPortIsStillNotHedged(t *testing.T) {
 	hc.check()
 	for _, p := range proxies {
 		if history := delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(target.url())); len(history) != 1 {
-			t.Fatalf("%s: a refused connection is one probe, got %v", p.Name(), history)
+			t.Fatalf("%s: one round, one failure, got %v", p.Name(), history)
+		}
+		if p.AliveForTestUrl(target.url()) {
+			t.Fatalf("%s: a closed port found twice is dead", p.Name())
 		}
 	}
 }
@@ -450,23 +481,70 @@ func TestAProbeThatWaitedForItsTurnIsNotHedgedAtOnce(t *testing.T) {
 	}
 }
 
-func TestASlowNodeThatStallsGetsOneProbe(t *testing.T) {
-	// The Android build runs Go timers of 1.23 and later: Stop on a timer that
-	// fired unread still reports true. A slow node never reads its hedge timer,
-	// and its stalled probe must not be followed by a second one.
-	target := newProbeTarget(t, probeHedgeDelay+300*time.Millisecond, "slow", "slow", "stall", "ok")
+// seedElapsed records a passed probe of url that took elapsed as a whole.
+func seedElapsed(proxy *adapter.Proxy, url string, elapsed time.Duration) {
+	proxy.RecordProbe(url, &C.ProbeResult{Held: true, Time: time.Now(), Delay: uint16(elapsed.Milliseconds()), Satisfied: true, Elapsed: elapsed})
+}
+
+func TestASlowNodeThatStallsGetsASecondProbe(t *testing.T) {
+	// The node's probes take most of a short timeout: its second probe comes
+	// early enough to finish by the hedge delay and the timeout, instead of
+	// a single stall marking it dead.
+	const slow = probeHedgeDelay + 300*time.Millisecond
+	target := newProbeTarget(t, slow, "stall", "slow")
 	proxy := adapter.NewProxy(outbound.NewDirect())
+	seedElapsed(proxy, target.url(), slow)
 	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 2000, 0, false, nil)
 	t.Cleanup(hc.close)
-	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed {
-		t.Fatalf("first round: %v", outcome)
+	began := time.Now()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeRecovered || !proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("a slow node that stalled once: %v, alive %v", outcome, proxy.AliveForTestUrl(target.url()))
 	}
-	before := target.connections()
-	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeFailed {
-		t.Fatalf("a slow node that stalled: %v, want failed", outcome)
+	if elapsed := time.Since(began); elapsed > probeHedgeDelay+2000*time.Millisecond {
+		t.Fatalf("the probe ends by the hedge delay and the timeout, took %s", elapsed)
 	}
-	if got := target.connections() - before; got != 1 {
-		t.Fatalf("a slow node that stalled gets one probe, saw %d", got)
+}
+
+func TestASlowNodeWhoseProbeDropsGetsASecondProbeAtOnce(t *testing.T) {
+	// The first probe fails after the hedge delay but before the slow node's
+	// later hedge: the second probe starts right away.
+	const pause = probeHedgeDelay + 300*time.Millisecond
+	target := newProbeTarget(t, pause, "drop", "ok")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	seedElapsed(proxy, target.url(), 1500*time.Millisecond)
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 5000, 0, false, nil)
+	t.Cleanup(hc.close)
+	began := time.Now()
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeRecovered {
+		t.Fatalf("outcome %v", outcome)
+	}
+	if elapsed := time.Since(began); elapsed > pause+500*time.Millisecond {
+		t.Fatalf("the second probe must follow the failure at once, took %s", elapsed)
+	}
+}
+
+func TestTheHedgeFitsTheProbeBudget(t *testing.T) {
+	for _, c := range []struct {
+		timeout, elapsed, want time.Duration
+	}{
+		{5 * time.Second, 0, probeHedgeDelay},
+		{5 * time.Second, 500 * time.Millisecond, probeHedgeDelay},
+		{5 * time.Second, 1200 * time.Millisecond, 2400 * time.Millisecond},
+		{5 * time.Second, 2 * time.Second, 3 * time.Second},
+		{5 * time.Second, 3 * time.Second, 1500 * time.Millisecond},
+		{5 * time.Second, 5 * time.Second, probeHedgeDelay},
+		{2 * time.Second, 1300 * time.Millisecond, 1050 * time.Millisecond},
+	} {
+		hc := &HealthCheck{timeout: c.timeout}
+		got := hc.hedgeAt(c.elapsed)
+		if got != c.want {
+			t.Errorf("timeout %s, last probe %s: hedge at %s, want %s", c.timeout, c.elapsed, got, c.want)
+		}
+		// The second probe keeps at least as long as the last probe took, up
+		// to the timeout, within the hedge delay and the timeout.
+		if left := probeHedgeDelay + c.timeout - got; left < c.elapsed && left < c.timeout {
+			t.Errorf("timeout %s, last probe %s: the second probe gets %s", c.timeout, c.elapsed, left)
+		}
 	}
 }
 

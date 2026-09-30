@@ -201,7 +201,6 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 				Status:    status,
 				Stage:     stage,
 				Elapsed:   time.Since(began),
-				Answered:  isDefiniteAnswer(err),
 			}
 			return
 		}
