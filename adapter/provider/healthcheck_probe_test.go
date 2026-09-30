@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -300,5 +301,35 @@ func TestAPacedProbeOfAClosedPortIsStillNotHedged(t *testing.T) {
 		if history := delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(target.url())); len(history) != 1 {
 			t.Fatalf("%s: a refused connection is one probe, got %v", p.Name(), history)
 		}
+	}
+}
+
+func TestTheHedgeWaitingForItsTurnDoesNotHoldBackTheFirstAnswer(t *testing.T) {
+	// Other nodes of the host have booked its start slots ahead: the second
+	// probe waits for one, and the first probe's answer meanwhile must end
+	// the probe at once rather than after that wait.
+	target := newProbeTarget(t, probeHedgeDelay+300*time.Millisecond, "slow", "ok")
+	node, _ := outbound.NewHttp(outbound.HttpOption{Name: "n", Server: "127.0.0.1", Port: target.port()})
+	proxy := adapter.NewProxy(node)
+	var booked sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		booked.Add(1)
+		go func() {
+			defer booked.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = C.ProbePace(ctx, "127.0.0.1")
+		}()
+	}
+	// The slots are used up before the next test probes the same host.
+	t.Cleanup(booked.Wait)
+	time.Sleep(50 * time.Millisecond)
+	began := time.Now()
+	_, err := ProbeNode(C.MarkProbePaced(context.Background()), proxy, target.url(), nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("the node answered its first probe: %v", err)
+	}
+	if elapsed := time.Since(began); elapsed > probeHedgeDelay+700*time.Millisecond {
+		t.Fatalf("the answer waited for the second probe's turn: %s", elapsed)
 	}
 }

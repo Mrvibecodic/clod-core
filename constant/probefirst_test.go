@@ -27,20 +27,22 @@ func TestProbeFirstOrderMovesTheCurrentNodesToTheFront(t *testing.T) {
 		name    string
 		current []Proxy
 		want    string
+		head    int
 	}{
-		{"nothing registered", nil, "abcd"},
-		{"current last", []Proxy{d}, "dabc"},
-		{"two current keep their order", []Proxy{c, b}, "bcad"},
-		{"current already first", []Proxy{a}, "abcd"},
-		{"current not in the list", []Proxy{other}, "abcd"},
-		{"replaced object of the same node", []Proxy{&orderedProxy{name: "c"}}, "cabd"},
-		{"namesake of another provider", []Proxy{&orderedProxy{name: "c", provider: "other"}}, "abcd"},
+		{"nothing registered", nil, "abcd", 0},
+		{"current last", []Proxy{d}, "dabc", 1},
+		{"two current keep their order", []Proxy{c, b}, "bcad", 2},
+		{"current already first", []Proxy{a}, "abcd", 1},
+		{"current not in the list", []Proxy{other}, "abcd", 0},
+		{"replaced object of the same node", []Proxy{&orderedProxy{name: "c"}}, "cabd", 1},
+		{"namesake of another provider", []Proxy{&orderedProxy{name: "c", provider: "other"}}, "abcd", 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			SetProbeFirst(func() []Proxy { return tt.current })
 			defer SetProbeFirst(nil)
-			if got := names(ProbeFirstOrder(list)); got != tt.want {
-				t.Fatalf("order = %s, want %s", got, tt.want)
+			ordered, head := ProbeFirstOrder(list)
+			if got := names(ordered); got != tt.want || head != tt.head {
+				t.Fatalf("order = %s (%d first), want %s (%d first)", got, head, tt.want, tt.head)
 			}
 			if got := names(list); got != "abcd" {
 				t.Fatalf("the input was reordered in place: %s", got)

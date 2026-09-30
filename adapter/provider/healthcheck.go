@@ -139,21 +139,23 @@ func (hc *HealthCheck) check() {
 	}
 
 	_, _, _ = hc.singleDo.Do(func() (struct{}, error) {
-		proxies := C.ProbeFirstOrder(hc.snapshotProxies())
+		proxies, head := C.ProbeFirstOrder(hc.snapshotProxies())
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
 		b.SetLimit(10)
 
-		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
 		tally := &probeTally{}
-		hc.execute(b, proxies, hc.url, id, option, tally)
+		// The nodes the groups use go first on every URL: a group with a URL of
+		// its own (an extra one) ranks its nodes by that URL, not the provider's.
+		for _, part := range [][]C.Proxy{proxies[:head], proxies[head:]} {
+			// execute default health check
+			hc.execute(b, part, hc.url, id, option, tally)
 
-		// execute extra health check
-		if len(hc.extra) != 0 {
+			// execute extra health check
 			for url, option := range hc.extra {
-				hc.execute(b, proxies, url, id, option, tally)
+				hc.execute(b, part, url, id, option, tally)
 			}
 		}
 		_ = b.Wait()
@@ -198,6 +200,9 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 		p := proxy
 		b.Go(func() error {
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
+			// A node that was already dead stalls every round: it says nothing
+			// about the local side, which is what the round's count is about.
+			wasAlive := p.AliveForTestUrl(url)
 			outcome, _ := hc.probe(p, url, expectedStatus)
 			if outcome == probeCancelled || outcome == probeShared {
 				return nil
@@ -207,7 +212,9 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 			case probeRecovered:
 				tally.recovered.Add(1)
 			case probeStalled:
-				tally.stalled.Add(1)
+				if wasAlive {
+					tally.stalled.Add(1)
+				}
 			}
 			log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
 			return nil
@@ -290,25 +297,33 @@ func (r *probeRun) finished() bool {
 // out) and then runs the probe in the background: the hedge timer of the
 // caller counts from the probe's own start, not from the wait for the slot.
 func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], hedge bool) *probeRun {
-	ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+	base, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 	if hedge {
 		// A caller that paced its probe paced the first one only.
-		ctx = C.UnmarkProbePaced(ctx)
+		base = C.UnmarkProbePaced(base)
 	}
 	run := &probeRun{result: &C.ProbeResult{}, done: make(chan struct{}), cancel: cancel}
-	if err := C.ProbePace(ctx, C.ProbeHost(p.Addr())); err != nil {
-		// The check was cancelled while the probe waited for its turn:
-		// nothing ran, the result stays unheld.
-		run.started = time.Now()
-		close(run.done)
-		return run
+	pace := func() error { return C.ProbePace(base, C.ProbeHost(p.Addr())) }
+	if !hedge {
+		if err := pace(); err != nil {
+			// The check was cancelled while the probe waited for its turn:
+			// nothing ran, the result stays unheld.
+			run.started = time.Now()
+			close(run.done)
+			return run
+		}
 	}
-	ctx = C.MarkProbePaced(ctx)
-	ctx, held := C.WithHeldProbe(ctx)
+	ctx, held := C.WithHeldProbe(C.MarkProbePaced(base))
 	run.started = time.Now()
 	run.result = held
 	go func() {
 		defer close(run.done)
+		// The second probe waits for its turn in the background: an answer to
+		// the first one that comes meanwhile is taken at once. A wait that is
+		// cut short leaves the result unheld.
+		if hedge && pace() != nil {
+			return
+		}
 		_, _ = p.URLTest(ctx, url, expectedStatus)
 	}()
 	return run
@@ -432,7 +447,11 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 				}
 				continue
 			}
-			recorder.RecordSoftFailure(url, first.started)
+			// A first probe whose failure was set aside (the network was
+			// switching) is no failure of the node.
+			if !first.finished() || first.result.Held {
+				recorder.RecordSoftFailure(url, first.started)
+			}
 			recorder.RecordProbe(url, second.result)
 			log.Debugln("[Проба] %s: первая проба не ответила за %d мс, повторная прошла: %s",
 				p.Name(), time.Since(first.started).Milliseconds(), second.result)
