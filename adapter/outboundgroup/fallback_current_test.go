@@ -1,0 +1,39 @@
+package outboundgroup
+
+import (
+	"testing"
+
+	C "github.com/metacubex/mihomo/constant"
+	P "github.com/metacubex/mihomo/constant/provider"
+)
+
+// Reading the current node of a fallback group does not drop a selection
+// whose node is down; only a dial does.
+func TestFallbackCurrentNodeKeepsADownSelection(t *testing.T) {
+	a := &measuredProxy{name: "A", delay: 100, alive: true}
+	b := &measuredProxy{name: "B", delay: 100, alive: false}
+	c := &measuredProxy{name: "C", delay: 100, alive: true}
+	provider := &measuredProvider{proxies: []C.Proxy{a, b, c}, version: 1}
+	group, err := NewFallback(GroupCommonOption{Name: "fb", URL: "https://probe.invalid/"}, FallbackOption{}, a, []P.ProxyProvider{provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.selected = "B"
+
+	if got := group.CurrentNode(); got != C.Proxy(c) {
+		t.Fatalf("current node with the selection down = %v, want the next alive node C", got)
+	}
+	if group.selected != "B" {
+		t.Fatalf("reading the current node dropped the selection: %q", group.selected)
+	}
+
+	if got := group.findAliveProxy(false); got != C.Proxy(c) || group.selected != "" {
+		t.Fatalf("a dial keeps passing over the down selection and drops it: %v, %q", got, group.selected)
+	}
+
+	b.alive = true
+	group.selected = "B"
+	if got := group.CurrentNode(); got != C.Proxy(b) {
+		t.Fatalf("current node with the selection alive = %v, want B", got)
+	}
+}
