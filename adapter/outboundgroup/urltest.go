@@ -243,14 +243,21 @@ func (u *URLTest) IsL3Protocol(metadata *C.Metadata) bool {
 }
 
 // MarshalJSON implements C.ProxyAdapter
+// MarshalJSON describes the group as it is: reading it does not make a new
+// choice, as a dial would. Before the first dial there is no node yet, and
+// the one the group would pick is shown.
 func (u *URLTest) MarshalJSON() ([]byte, error) {
 	all := []string{}
 	for _, proxy := range u.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
+	now := u.Now
+	if current := u.CurrentNode(); current != nil {
+		now = current.Name
+	}
 	return json.Marshal(map[string]any{
 		"type":           u.Type().String(),
-		"now":            u.Now(),
+		"now":            now(),
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
