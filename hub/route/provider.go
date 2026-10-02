@@ -33,6 +33,7 @@ func proxyProviderProxyRouter() http.Handler {
 		r.Use(parseProxyName, findProviderProxyByName)
 		r.Get("/", getProxy)
 		r.Get("/healthcheck", getProxyDelay)
+		r.Get("/download", getProxyDownload)
 	})
 	return r
 }

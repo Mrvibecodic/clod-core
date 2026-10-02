@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/utils"
@@ -31,6 +33,7 @@ func proxyRouter() http.Handler {
 		r.Use(parseProxyName, findProxyByName)
 		r.Get("/", getProxy)
 		r.Get("/delay", getProxyDelay)
+		r.Get("/download", getProxyDownload)
 		r.Put("/", updateProxy)
 		r.Delete("/", unfixedProxy)
 	})
@@ -152,6 +155,52 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, render.M{
 		"delay": delay,
 	})
+}
+
+// downloadChecker is a node parsed from a config or a provider: groups and
+// the built-in proxies have no fingerprint.
+type downloadChecker interface {
+	Fingerprint() string
+	DownloadCheck(ctx context.Context, url string, size int64, timeout, stall time.Duration, pingURL string) adapter.DownloadResult
+}
+
+// downloadMaxSize keeps a check from turning into a download.
+const downloadMaxSize = 1 << 20
+
+// getProxyDownload tells whether traffic passes the node: it downloads size
+// bytes of url through it and answers ok, frozen (cut after the first
+// kilobytes), dead (nothing passes) or unknown.
+func getProxyDownload(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	target := query.Get("url")
+	size, sizeErr := strconv.ParseInt(query.Get("size"), 10, 64)
+	timeout, timeoutErr := strconv.ParseInt(query.Get("timeout"), 10, 64)
+	stall, stallErr := strconv.ParseInt(query.Get("stall"), 10, 64)
+	parsed, urlErr := url.Parse(target)
+	if sizeErr != nil || timeoutErr != nil || stallErr != nil || urlErr != nil ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" ||
+		size <= 0 || size > downloadMaxSize || timeout <= 0 || timeout > 60000 || stall <= 0 || stall > timeout {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+
+	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
+	node, ok := proxy.(downloadChecker)
+	if !ok || node.Fingerprint() == "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("Must be a node"))
+		return
+	}
+
+	// The check may wait for its turn to the host, then download, then
+	// probe; a client that gives up stops it.
+	attempt := time.Millisecond * time.Duration(timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), C.ProbeReserve+attempt+adapter.DownloadPingTimeout+C.ProbeReserve)
+	defer cancel()
+
+	result := node.DownloadCheck(ctx, target, size, attempt, time.Millisecond*time.Duration(stall), tunnel.DownloadPingURL(proxy))
+	render.JSON(w, r, result)
 }
 
 func unfixedProxy(w http.ResponseWriter, r *http.Request) {
