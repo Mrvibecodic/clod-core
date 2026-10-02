@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -77,5 +78,43 @@ func TestADelayRequestConfirmsAFailureLikeTheScheduledCheck(t *testing.T) {
 	getProxyDelay(rec, req)
 	if rec.Code != http.StatusOK || !proxy.AliveForTestUrl(url) || conns() != 2 {
 		t.Fatalf("code %d, body %s, alive %t, connections %d", rec.Code, rec.Body.String(), proxy.AliveForTestUrl(url), conns())
+	}
+}
+
+func downloadRequest(proxy any, query string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/proxies/node/download?"+query, nil)
+	req = req.WithContext(context.WithValue(req.Context(), CtxKeyProxy, proxy))
+	rec := httptest.NewRecorder()
+	getProxyDownload(rec, req)
+	return rec
+}
+
+func TestADownloadCheckIsOnlyForNodes(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer target.Close()
+	node, err := adapter.ParseProxy(map[string]any{"name": "node", "type": "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := "size=1024&timeout=2000&stall=500&url=" + target.URL
+
+	if rec := downloadRequest(adapter.NewProxy(outbound.NewDirect()), query); rec.Code != http.StatusBadRequest {
+		t.Fatalf("DIRECT: code %d, body %s", rec.Code, rec.Body.String())
+	}
+	for _, bad := range []string{
+		"size=2000000&timeout=2000&stall=500&url=" + target.URL,
+		"size=1024&timeout=2000&stall=3000&url=" + target.URL,
+		"size=1024&timeout=2000&stall=500&url=ftp://example.com/",
+		"size=1024&stall=500&url=" + target.URL,
+	} {
+		if rec := downloadRequest(node, bad); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code %d, body %s", bad, rec.Code, rec.Body.String())
+		}
+	}
+	rec := downloadRequest(node, query)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"verdict":"ok"`) {
+		t.Fatalf("code %d, body %s", rec.Code, rec.Body.String())
 	}
 }
