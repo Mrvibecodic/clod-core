@@ -39,6 +39,15 @@ type Proxy struct {
 	alive   atomic.Bool
 	history *queue.Queue[C.DelayHistory]
 	extra   xsync.Map[string, *internalProxyState]
+	// fingerprint is set for the nodes parsed from a config or a provider:
+	// groups, DIRECT and REJECT have none.
+	fingerprint string
+}
+
+// Fingerprint identifies a node by how it connects; see fingerprint. It is
+// empty for groups and the built-in proxies.
+func (p *Proxy) Fingerprint() string {
+	return p.fingerprint
 }
 
 // Adapter implements C.Proxy
@@ -160,6 +169,9 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["routing-mark"] = proxyInfo.RoutingMark
 	mapping["provider-name"] = proxyInfo.ProviderName
 	mapping["dialer-proxy"] = proxyInfo.DialerProxy
+	if p.fingerprint != "" {
+		mapping["fingerprint"] = p.fingerprint
+	}
 
 	return json.Marshal(mapping)
 }

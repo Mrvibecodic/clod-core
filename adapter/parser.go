@@ -246,7 +246,9 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	}
 
 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
-	return NewProxy(proxy), nil
+	parsed := NewProxy(proxy)
+	parsed.fingerprint = fingerprint(mapping)
+	return parsed, nil
 }
 
 type proxyOption struct {
