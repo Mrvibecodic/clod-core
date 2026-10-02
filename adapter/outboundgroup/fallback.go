@@ -82,6 +82,8 @@ func (f *Fallback) IsL3Protocol(metadata *C.Metadata) bool {
 }
 
 // MarshalJSON implements C.ProxyAdapter
+// MarshalJSON describes the group as it is: reading it neither chooses a node
+// nor drops a selection whose node is down, as a dial would.
 func (f *Fallback) MarshalJSON() ([]byte, error) {
 	all := []string{}
 	for _, proxy := range f.GetProxies(false) {
@@ -89,7 +91,7 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(map[string]any{
 		"type":           f.Type().String(),
-		"now":            f.Now(),
+		"now":            f.CurrentNode().Name(),
 		"all":            all,
 		"testUrl":        f.testUrl,
 		"expectedStatus": f.expectedStatus,
