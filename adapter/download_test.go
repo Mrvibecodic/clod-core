@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	C "github.com/metacubex/mihomo/constant"
+
 	"github.com/metacubex/http"
 )
 
@@ -153,6 +155,16 @@ func TestADownloadCheckCountsTheBytesThatCame(t *testing.T) {
 	url := downloadTarget(t, serveBody(16<<10))
 	result := directNode(t).DownloadCheck(context.Background(), url, testSize, 2*time.Second, 300*time.Millisecond, "")
 	if result.Received < 16<<10 || result.Received >= testSize || result.Status != http.StatusOK || result.Verdict != DownloadFrozen {
+		t.Fatalf("result %+v", result)
+	}
+}
+
+func TestACutUnderTheProbeHoldSaysNothing(t *testing.T) {
+	url := downloadTarget(t, serveBody(16<<10))
+	C.SetProbeHoldUntil(time.Now().Add(time.Minute))
+	defer C.SetProbeHoldUntil(time.Time{})
+	result := directNode(t).DownloadCheck(context.Background(), url, testSize, 2*time.Second, 300*time.Millisecond, "")
+	if result.Verdict != DownloadUnknown {
 		t.Fatalf("result %+v", result)
 	}
 }

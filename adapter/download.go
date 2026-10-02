@@ -87,6 +87,12 @@ func (p *Proxy) DownloadCheck(ctx context.Context, url string, size int64, timeo
 	if conn != nil {
 		result.Received = conn.received.Load()
 	}
+	// A failure under the probe hold (network switching, process was paused)
+	// says nothing about the node.
+	failed := verdict == DownloadFrozen || verdict == DownloadDead
+	if failed && (C.ProbeHolding(began) || C.ProbeHolding(time.Now())) {
+		return
+	}
 	if verdict != DownloadDead {
 		result.Verdict = verdict
 		return
