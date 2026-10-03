@@ -1,6 +1,7 @@
 package outboundgroup
 
 import (
+	"fmt"
 	"net/netip"
 	"testing"
 
@@ -48,7 +49,14 @@ func request(user, host string) *C.Metadata {
 // default key moves it as soon as the host changes.
 func TestLoadBalanceHashKeyInUserSurvivesADestinationChange(t *testing.T) {
 	proxies := balancedProxies(8)
-	hosts := []string{"a.example.com", "b.example.org", "c.example.net", "d.example.io"}
+	// The hash is salted per process: with four hosts all of them landed on
+	// one of the eight nodes about once in five hundred runs, and the second
+	// half of the test failed for nothing. Thirty-two distinct registrable
+	// domains (the default key hashes eTLD+1) make that odds of one in 8^31.
+	hosts := make([]string, 0, 32)
+	for i := 0; i < cap(hosts); i++ {
+		hosts = append(hosts, fmt.Sprintf("www.site-%d.example", i))
+	}
 
 	byUser := strategyConsistentHashing(testUrl, getKeyWithInUser(getKey))
 	pinned := indexOf(t, proxies, byUser(proxies, request("job-1", hosts[0]), false))
