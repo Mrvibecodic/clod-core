@@ -93,3 +93,28 @@ func TestMapsWithUntypedKeysHaveAFingerprint(t *testing.T) {
 		t.Fatalf("fingerprints %q and %q", typed, untyped)
 	}
 }
+
+func TestEntriesThatLeadToNoServerHaveNoFingerprint(t *testing.T) {
+	for _, text := range []string{
+		"{name: without VPN, type: direct}",
+		"{name: block, type: reject}",
+		"{name: dns, type: dns}",
+		"{name: Devices limit, type: vless, server: 0.0.0.0, port: 443, uuid: 0d2f7f7c-55b3-4e8f-9c4d-2b8f2a6d1e11}",
+		"{name: Expired, type: vless, server: example.com, port: 443, uuid: 00000000-0000-0000-0000-000000000000}",
+		"{name: Info, type: socks5, server: example.com, port: 1}",
+		"{name: v6, type: trojan, server: '::', port: 443, password: secret}",
+	} {
+		if fp := parseNode(t, text).Fingerprint(); fp != "" {
+			t.Fatalf("%s: fingerprint %q", text, fp)
+		}
+	}
+	for _, text := range []string{
+		"{name: node, type: trojan, server: example.com, port: 443, password: secret}",
+		"{name: low port with a key, type: ss, server: example.com, port: 1, cipher: aes-128-gcm, password: secret}",
+		"{name: local, type: socks5, server: 127.0.0.1, port: 1080}",
+	} {
+		if fp := parseNode(t, text).Fingerprint(); len(fp) != 16 {
+			t.Fatalf("%s: fingerprint %q", text, fp)
+		}
+	}
+}

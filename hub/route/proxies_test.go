@@ -3,6 +3,7 @@ package route
 import (
 	"bufio"
 	"context"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -81,6 +82,41 @@ func TestADelayRequestConfirmsAFailureLikeTheScheduledCheck(t *testing.T) {
 	}
 }
 
+// connectProxy is an HTTP proxy that tunnels CONNECT to wherever it is asked.
+func connectProxy(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				req, err := http.ReadRequest(reader)
+				if err != nil || req.Method != http.MethodConnect {
+					return
+				}
+				upstream, err := net.Dial("tcp", req.Host)
+				if err != nil {
+					return
+				}
+				defer upstream.Close()
+				_, _ = conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+				go func() { _, _ = io.Copy(upstream, reader) }()
+				_, _ = io.Copy(conn, upstream)
+			}()
+		}
+	}()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
 func downloadRequest(proxy any, query string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, "/proxies/node/download?"+query, nil)
 	req = req.WithContext(context.WithValue(req.Context(), CtxKeyProxy, proxy))
@@ -94,7 +130,11 @@ func TestADownloadCheckIsOnlyForNodes(t *testing.T) {
 		_, _ = w.Write(make([]byte, 1024))
 	}))
 	defer target.Close()
-	node, err := adapter.ParseProxy(map[string]any{"name": "node", "type": "direct"})
+	node, err := adapter.ParseProxy(map[string]any{"name": "node", "type": "http", "server": "127.0.0.1", "port": connectProxy(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutVPN, err := adapter.ParseProxy(map[string]any{"name": "without VPN", "type": "direct"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,6 +142,9 @@ func TestADownloadCheckIsOnlyForNodes(t *testing.T) {
 
 	if rec := downloadRequest(adapter.NewProxy(outbound.NewDirect()), query); rec.Code != http.StatusBadRequest {
 		t.Fatalf("DIRECT: code %d, body %s", rec.Code, rec.Body.String())
+	}
+	if rec := downloadRequest(withoutVPN, query); rec.Code != http.StatusBadRequest {
+		t.Fatalf("type direct: code %d, body %s", rec.Code, rec.Body.String())
 	}
 	for _, bad := range []string{
 		"size=2000000&timeout=2000&stall=500&url=" + target.URL,
