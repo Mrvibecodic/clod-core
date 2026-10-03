@@ -23,15 +23,12 @@ import (
 	"github.com/metacubex/http"
 )
 
-// Clod: the core updates itself from the Clod Core releases, never from
-// MetaCubeX — a stock build would silently replace the patches. There is no
-// alpha channel: both channels point at the latest release.
 const (
-	baseReleaseURL    = "https://github.com/Mrvibecodic/clod-core/releases/latest/download/"
-	versionReleaseURL = "https://github.com/Mrvibecodic/clod-core/releases/latest/download/version.txt"
+	baseReleaseURL    = "https://github.com/MetaCubeX/mihomo/releases/latest/download/"
+	versionReleaseURL = "https://github.com/MetaCubeX/mihomo/releases/latest/download/version.txt"
 
-	baseAlphaURL    = baseReleaseURL
-	versionAlphaURL = versionReleaseURL
+	baseAlphaURL    = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/"
+	versionAlphaURL = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt"
 
 	// MaxPackageFileSize is a maximum package file length in bytes. The largest
 	// package whose size is limited by this constant currently has the size of
@@ -72,9 +69,8 @@ func (u *CoreUpdater) CoreBaseName() string {
 			// mihomo-android-amd64
 			return fmt.Sprintf("mihomo-%s-%s", runtime.GOOS, runtime.GOARCH)
 		}
-		// Clod: amd64 assets carry no GOAMD64 level (mihomo-linux-amd64):
-		// every release is built for v1, so there is nothing to choose.
-		return fmt.Sprintf("mihomo-%s-%s", runtime.GOOS, runtime.GOARCH)
+		// mihomo-linux-amd64-v1
+		return fmt.Sprintf("mihomo-%s-%s-%s", runtime.GOOS, runtime.GOARCH, features.GOAMD64)
 	default:
 		// mihomo-linux-386
 		// mihomo-linux-mips64
@@ -162,15 +158,6 @@ func (u *CoreUpdater) Update(currentExePath string, channel string, force bool) 
 	err = u.unpack(updateDir, packagePath, info.Mode())
 	if err != nil {
 		return fmt.Errorf("unpacking: %w", err)
-	}
-
-	// Clod: the new core must start on this machine before it replaces the
-	// running one: nothing brings the old one back once it is replaced, and a
-	// build that cannot run here (CPU, OS version, a damaged download) left
-	// the service restarting a dead core.
-	err = u.probeCore(updateExePath)
-	if err != nil {
-		return fmt.Errorf("checking the new core: %w", err)
 	}
 
 	err = u.backup(currentExePath, backupExePath, backupDir)
@@ -300,21 +287,6 @@ func (u *CoreUpdater) backup(currentExePath, backupExePath, backupDir string) (e
 		return err
 	}
 
-	return nil
-}
-
-// probeCore runs the unpacked core with -v: it prints its version and exits
-// before reading any configuration.
-func (u *CoreUpdater) probeCore(exePath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, exePath, "-v").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	if !strings.HasPrefix(string(out), "Mihomo Meta ") {
-		return fmt.Errorf("unexpected output: %q", strings.TrimSpace(string(out)))
-	}
 	return nil
 }
 
