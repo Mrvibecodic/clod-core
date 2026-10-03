@@ -39,8 +39,9 @@ type Proxy struct {
 	alive   atomic.Bool
 	history *queue.Queue[C.DelayHistory]
 	extra   xsync.Map[string, *internalProxyState]
-	// fingerprint is set for the nodes parsed from a config or a provider:
-	// groups, DIRECT and REJECT have none.
+	// fingerprint is set for the nodes parsed from a config or a provider
+	// (a direct or reject entry written there included); groups and the
+	// built-in DIRECT and REJECT have none.
 	fingerprint string
 }
 

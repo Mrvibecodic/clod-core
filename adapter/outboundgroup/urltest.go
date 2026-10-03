@@ -242,22 +242,44 @@ func (u *URLTest) IsL3Protocol(metadata *C.Metadata) bool {
 	return u.fast(false).IsL3Protocol(metadata)
 }
 
+// shown is the node a reader is told about: the pinned node while it is
+// alive (the next dial takes it), else the node in use while it is alive and
+// still in the group, else the node the group would pick. Reading does not
+// make a new choice as long as the current one still serves, as a dial would
+// not either; a dead or vanished current node is shown replaced, because
+// that is what the next dial does.
+func (u *URLTest) shown() string {
+	proxies := u.GetProxies(false)
+	usable := func(name string) bool {
+		for _, proxy := range proxies {
+			if proxy.Name() == name {
+				return proxy.AliveForTestUrl(u.testUrl)
+			}
+		}
+		return false
+	}
+	if selected := u.selected.Load(); selected != "" && usable(selected) {
+		return selected
+	}
+	if current := u.CurrentNode(); current != nil && usable(current.Name()) {
+		return current.Name()
+	}
+	return u.Now()
+}
+
 // MarshalJSON implements C.ProxyAdapter
 // MarshalJSON describes the group as it is: reading it does not make a new
-// choice, as a dial would. Before the first dial there is no node yet, and
-// the one the group would pick is shown.
+// choice while the node in use still serves, as a dial would not. Before the
+// first dial, or once the node in use is dead or gone, the one the group
+// would pick is shown.
 func (u *URLTest) MarshalJSON() ([]byte, error) {
 	all := []string{}
 	for _, proxy := range u.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
-	now := u.Now
-	if current := u.CurrentNode(); current != nil {
-		now = current.Name
-	}
 	return json.Marshal(map[string]any{
 		"type":           u.Type().String(),
-		"now":            now(),
+		"now":            u.shown(),
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
