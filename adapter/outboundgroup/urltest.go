@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -12,6 +13,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/hidden"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 )
@@ -32,6 +34,9 @@ type URLTest struct {
 	// fastMu serialises the choice: a Reset of fastSingle while a choice is
 	// being made lets a second one start alongside the first.
 	fastMu sync.Mutex
+	// hiddenGeneration — набор скрытых узлов, при котором сделан выбор:
+	// сменился — выбор делается заново, а не берётся из кеша.
+	hiddenGeneration stdatomic.Uint64
 }
 
 func (u *URLTest) Now() string {
@@ -44,18 +49,24 @@ func (u *URLTest) Now() string {
 func (u *URLTest) CurrentNode() C.Proxy {
 	u.fastMu.Lock()
 	defer u.fastMu.Unlock()
+	if u.fastNode != nil && hidden.Hides(u.fastNode) {
+		return nil
+	}
 	return u.fastNode
 }
 
 func (u *URLTest) Set(name string) error {
 	var p C.Proxy
 	for _, proxy := range u.GetProxies(false) {
-		if proxy.Name() == name {
+		if proxy.Name() == name && proxy != hiddenReject {
 			p = proxy
 			break
 		}
 	}
 	if p == nil {
+		if u.hiddenMember(name) {
+			return ErrHidden
+		}
 		return errors.New("proxy not exist")
 	}
 	u.ForceSet(name)
@@ -157,6 +168,10 @@ func (u *URLTest) score(p C.Proxy) uint32 {
 }
 
 func (u *URLTest) fast(touch bool) C.Proxy {
+	if generation := hidden.Generation(); u.hiddenGeneration.Load() != generation {
+		u.hiddenGeneration.Store(generation)
+		u.fastSingle.Reset()
+	}
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		u.fastMu.Lock()
 		defer u.fastMu.Unlock()

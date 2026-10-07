@@ -13,6 +13,8 @@ type Node struct {
 	RealityKey   bool
 	TLSMirrorKey bool
 	HTTPUpgrade  bool
+	// DialerProxy — через какой узел или группу узел соединяется (dialer-proxy).
+	DialerProxy string
 }
 
 // Node — см. Node; nil у групп и встроенных узлов.
@@ -20,11 +22,21 @@ func (p *Proxy) Node() *Node {
 	return p.node
 }
 
+// Server — узел из конфига или провайдера (не группа и не встроенный) и
+// через что он соединяется; ok=false у остальных.
+func (p *Proxy) Server() (dialerProxy string, ok bool) {
+	if p.node == nil {
+		return "", false
+	}
+	return p.node.DialerProxy, true
+}
+
 // nodeOption — поля узла под теми же ключами и с тем же разбором, что у
 // ParseProxy: ключи без учёта регистра и «_» как «-», мягкие типы.
 type nodeOption struct {
 	Network     string `proxy:"network,omitempty"`
 	TLS         bool   `proxy:"tls,omitempty"`
+	DialerProxy string `proxy:"dialer-proxy,omitempty"`
 	RealityOpts struct {
 		PublicKey string `proxy:"public-key,omitempty"`
 	} `proxy:"reality-opts,omitempty"`
@@ -48,5 +60,6 @@ func nodeOf(mapping map[string]any) *Node {
 		RealityKey:   opt.RealityOpts.PublicKey != "",
 		TLSMirrorKey: opt.TLSMirrorOpts.PrimaryKey != "",
 		HTTPUpgrade:  opt.WSOpts.V2rayHttpUpgrade,
+		DialerProxy:  opt.DialerProxy,
 	}
 }

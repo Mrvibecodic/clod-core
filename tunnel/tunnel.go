@@ -15,6 +15,7 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/hidden"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
@@ -232,6 +233,8 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	proxies = newProxies
 	providers = newProviders
 	configMux.Unlock()
+
+	hidden.LookupChanged()
 }
 
 func UpdateListeners(newListeners map[string]C.InboundListener) {

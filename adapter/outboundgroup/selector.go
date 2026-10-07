@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/metacubex/mihomo/component/hidden"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 )
@@ -84,13 +85,25 @@ func (s *Selector) Now() string {
 
 func (s *Selector) Set(name string) error {
 	for _, proxy := range s.GetProxies(false) {
-		if proxy.Name() == name {
+		if proxy.Name() == name && proxy != hiddenReject {
 			s.selected = name
 			return nil
 		}
 	}
 
+	// Скрытый узел не выбирается; выбор, сохранённый раньше, ставит ForceSet:
+	// пока узел скрыт, группа идёт через видимый и вернётся к нему, когда его
+	// покажут.
+	if s.hiddenMember(name) {
+		return ErrHidden
+	}
+
 	return errors.New("proxy not exist")
+}
+
+// SelectedHidden — выбранный пользователем узел сейчас скрыт.
+func (s *Selector) SelectedHidden() bool {
+	return s.selected != "" && s.hiddenMember(s.selected)
 }
 
 func (s *Selector) ForceSet(name string) {
@@ -103,10 +116,29 @@ func (s *Selector) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (s *Selector) selectedProxy(touch bool) C.Proxy {
-	proxies := s.GetProxies(touch)
+	proxies, all := s.members(touch)
 	for _, proxy := range proxies {
 		if proxy.Name() == s.selected {
+			if hidden.Active() && groupAllHidden(proxy) {
+				return visibleFallback(proxies)
+			}
 			return proxy
+		}
+	}
+
+	// Выбора нет (или он пропал) — первый член группы, как в конфиге. Без
+	// скрытых это proxies[0], как в ядре; скрыт он — видимый сервер, а не
+	// DIRECT, что мог оказаться первым среди видимых.
+	if hidden.Active() {
+		first := all[0]
+		for _, proxy := range all {
+			if proxy.Name() == s.selected {
+				first = proxy
+				break
+			}
+		}
+		if first != proxies[0] || groupAllHidden(first) {
+			return visibleFallback(proxies)
 		}
 	}
 

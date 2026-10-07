@@ -159,13 +159,16 @@ func aliveProxy(proxies []C.Proxy, selected, testUrl string) (proxy C.Proxy, sel
 func (f *Fallback) Set(name string) error {
 	var p C.Proxy
 	for _, proxy := range f.GetProxies(false) {
-		if proxy.Name() == name {
+		if proxy.Name() == name && proxy != hiddenReject {
 			p = proxy
 			break
 		}
 	}
 
 	if p == nil {
+		if f.hiddenMember(name) {
+			return ErrHidden
+		}
 		return errors.New("proxy not exist")
 	}
 

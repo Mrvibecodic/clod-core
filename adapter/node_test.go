@@ -33,8 +33,8 @@ alterId: 0, cipher: auto, network: ws, tls: true, tlsmirror-opts: {primary-key: 
 // Ключи — как их читает ParseProxy: без учёта регистра и с «_» вместо «-».
 func TestANodeIsReadWithTheKeysTheCoreAccepts(t *testing.T) {
 	proxy := parseNode(t, `{Name: n, type: vless, Server: a.example.com, port: 443, UUID: 00000000-0000-0000-0000-000000000000,
-Network: ws, TLS: true, ws_opts: {path: /, V2RAY_HTTP_UPGRADE: true}}`)
-	if got := *proxy.Node(); got != (Node{Network: "ws", TLS: true, HTTPUpgrade: true}) {
+Network: ws, TLS: true, ws_opts: {path: /, V2RAY_HTTP_UPGRADE: true}, dialer_proxy: relay}`)
+	if got := *proxy.Node(); got != (Node{Network: "ws", TLS: true, HTTPUpgrade: true, DialerProxy: "relay"}) {
 		t.Fatalf("node: %+v", got)
 	}
 
@@ -42,5 +42,9 @@ Network: ws, TLS: true, ws_opts: {path: /, V2RAY_HTTP_UPGRADE: true}}`)
 tls: true, Reality_Opts: {Public_Key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}}`)
 	if got := *proxy.Node(); !got.RealityKey {
 		t.Fatalf("node: %+v", got)
+	}
+
+	if dialer, ok := proxy.Server(); !ok || dialer != "" {
+		t.Fatalf("сервер: %q %v", dialer, ok)
 	}
 }

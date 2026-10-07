@@ -11,6 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/hidden"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -230,6 +231,11 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 	}
 
 	for _, proxy := range proxies {
+		// Скрытые клиентом узлы не проверяются (component/hidden).
+		if hidden.Hides(proxy) {
+			continue
+		}
+
 		// skip proxies that do not require health check
 		if filterReg != nil {
 			if match, _ := filterReg.MatchString(proxy.Name()); !match {

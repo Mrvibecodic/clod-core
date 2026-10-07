@@ -8,10 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/hidden"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
@@ -45,6 +47,55 @@ type GroupBase struct {
 	getProxiesMutex  sync.Mutex
 	providerVersions []uint32
 	providerProxies  []C.Proxy
+	allProxies       []C.Proxy
+	hiddenGeneration uint64
+}
+
+// hiddenReject — член группы, у которой скрыты все узлы (component/hidden):
+// такая группа отказывает, а не выпускает напрямую, как EmptyFallback. Его
+// нельзя выбрать: выбор пользователя остаётся за ним.
+var hiddenReject C.Proxy = adapter.NewProxy(outbound.NewReject())
+
+// ErrHidden — узел группы сейчас скрыт: выбрать его нельзя.
+var ErrHidden = errors.New("proxy hidden")
+
+// AllHidden — все узлы группы скрыты: её список — один hiddenReject.
+func AllHidden(proxies []C.Proxy) bool {
+	return len(proxies) == 1 && proxies[0] == hiddenReject
+}
+
+// isServer — узел из конфига или провайдера, а не группа и не встроенный.
+func isServer(p C.Proxy) bool {
+	s, ok := p.(interface{ Server() (string, bool) })
+	if !ok {
+		return false
+	}
+	_, ok = s.Server()
+	return ok
+}
+
+// groupAllHidden — p — группа, у которой скрыты все узлы: через неё отказ.
+func groupAllHidden(p C.Proxy) bool {
+	g, ok := p.Adapter().(ProxyGroup)
+	return ok && AllHidden(g.Proxies())
+}
+
+// visibleFallback — куда идёт группа, когда её выбор скрыт: первый видимый
+// сервер, иначе первая группа, у которой видно хоть что-то; встроенные
+// (DIRECT и др.) не годятся — скрытый выбор не выпускает напрямую. Ничего —
+// отказ.
+func visibleFallback(proxies []C.Proxy) C.Proxy {
+	for _, p := range proxies {
+		if isServer(p) {
+			return p
+		}
+	}
+	for _, p := range proxies {
+		if _, ok := p.Adapter().(ProxyGroup); ok && !groupAllHidden(p) {
+			return p
+		}
+	}
+	return hiddenReject
 }
 
 type GroupBaseOption struct {
@@ -119,6 +170,21 @@ func (gb *GroupBase) EmptyFallback() C.Proxy {
 	return gb.emptyFallback
 }
 
+// hiddenMember — узел группы, сейчас скрытый (component/hidden).
+func (gb *GroupBase) hiddenMember(name string) bool {
+	if !hidden.Active() {
+		return false
+	}
+	_, all := gb.members(false)
+	for _, p := range all {
+		if p.Name() == name && hidden.Hides(p) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (gb *GroupBase) Touch() {
 	for _, pd := range gb.providers {
 		pd.Touch()
@@ -126,6 +192,12 @@ func (gb *GroupBase) Touch() {
 }
 
 func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
+	visible, _ := gb.members(touch)
+	return visible
+}
+
+// members — члены группы без скрытых (как GetProxies) и все, как в конфиге.
+func (gb *GroupBase) members(touch bool) (visible, all []C.Proxy) {
 	providerVersions := make([]uint32, len(gb.providers))
 	for i, pd := range gb.providers {
 		if touch { // touch first
@@ -133,14 +205,15 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 		}
 		providerVersions[i] = pd.Version()
 	}
+	hiddenGeneration := hidden.Generation()
 
 	// thread safe
 	gb.getProxiesMutex.Lock()
 	defer gb.getProxiesMutex.Unlock()
 
 	// return the cached proxies if version not changed
-	if slices.Equal(providerVersions, gb.providerVersions) {
-		return gb.providerProxies
+	if slices.Equal(providerVersions, gb.providerVersions) && hiddenGeneration == gb.hiddenGeneration {
+		return gb.providerProxies, gb.allProxies
 	}
 
 	var proxies []C.Proxy
@@ -230,14 +303,30 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	}
 
 	if len(proxies) == 0 {
-		return []C.Proxy{gb.EmptyFallback()}
+		empty := []C.Proxy{gb.EmptyFallback()}
+		return empty, empty
+	}
+
+	visible = proxies
+	if hidden.Active() {
+		visible = make([]C.Proxy, 0, len(proxies))
+		for _, p := range proxies {
+			if !hidden.Hides(p) {
+				visible = append(visible, p)
+			}
+		}
+		if len(visible) == 0 {
+			visible = append(visible, hiddenReject)
+		}
 	}
 
 	// only cache when proxies not empty
 	gb.providerVersions = providerVersions
-	gb.providerProxies = proxies
+	gb.providerProxies = visible
+	gb.allProxies = proxies
+	gb.hiddenGeneration = hiddenGeneration
 
-	return proxies
+	return visible, proxies
 }
 
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
