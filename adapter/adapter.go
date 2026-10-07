@@ -42,6 +42,8 @@ type Proxy struct {
 	// fingerprint is set for the nodes parsed from a config or a provider:
 	// groups, DIRECT and REJECT have none.
 	fingerprint string
+	// node — see Node; only the nodes parsed from a config or a provider.
+	node *Node
 }
 
 // Fingerprint identifies a node by how it connects; see fingerprint. It is
