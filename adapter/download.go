@@ -26,7 +26,8 @@ const (
 	DownloadDead = "dead"
 	// DownloadUnknown: the check says nothing about the node — the site
 	// answered with an error, the node passes the probe but not the download,
-	// the data was still coming when the time ran out.
+	// the connection was closed or reset on its way, the data was still coming
+	// when the time ran out.
 	DownloadUnknown = "unknown"
 )
 
@@ -202,9 +203,13 @@ func (p *Proxy) download(ctx context.Context, url string, size int64, timeout, s
 		// The body ended before the size, whole: the site gave less than
 		// asked, the check did not check what it meant to.
 		return DownloadUnknown, resp.StatusCode
-	case ctx.Err() == nil || context.Cause(ctx) == errDownloadStalled:
-		// The body broke off on its way: the connection was cut.
+	case context.Cause(ctx) == errDownloadStalled:
+		// The data stopped coming on its way: the traffic is cut.
 		return DownloadFrozen, resp.StatusCode
+	case ctx.Err() == nil:
+		// The connection was closed or reset on its way, not left silent:
+		// that is not how the cut looks.
+		return DownloadUnknown, resp.StatusCode
 	}
 	// The time ran out while the data was still coming.
 	return failed(), resp.StatusCode

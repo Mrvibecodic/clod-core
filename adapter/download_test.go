@@ -116,10 +116,17 @@ func TestADownloadCheckTellsTheVerdicts(t *testing.T) {
 				_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n%s", make([]byte, 1024))
 			}
 		}, "", DownloadUnknown},
-		{"cut with a clean close", func(conn net.Conn) {
+		{"closed on its way", func(conn net.Conn) {
 			serveBody(16 << 10)(conn)
 			_ = conn.Close()
-		}, "", DownloadFrozen},
+		}, "", DownloadUnknown},
+		{"reset on its way", func(conn net.Conn) {
+			serveBody(16 << 10)(conn)
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetLinger(0)
+			}
+			_ = conn.Close()
+		}, "", DownloadUnknown},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
