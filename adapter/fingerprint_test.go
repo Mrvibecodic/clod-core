@@ -72,6 +72,52 @@ plugin-opts: {mode: tls, host: example.org}
 	}
 }
 
+func TestAFingerprintIgnoresTheNamesShownOnTheWire(t *testing.T) {
+	first := parseNode(t, `
+name: first
+type: vless
+server: example.com
+port: 443
+uuid: 0d2f7f7c-55b3-4e8f-9c4d-2b8f2a6d1e11
+tls: true
+servername: a.example.org
+network: ws
+ws-opts: {path: /ws, headers: {Host: a.example.org}}
+`)
+	again := parseNode(t, `
+name: first
+type: vless
+server: example.com
+port: 443
+uuid: 0d2f7f7c-55b3-4e8f-9c4d-2b8f2a6d1e11
+tls: true
+servername: b.example.org
+network: ws
+ws-opts: {path: /ws, headers: {Host: b.example.org}}
+`)
+	elsewhere := parseNode(t, `
+name: first
+type: vless
+server: example.net
+port: 443
+uuid: 0d2f7f7c-55b3-4e8f-9c4d-2b8f2a6d1e11
+tls: true
+servername: a.example.org
+network: ws
+ws-opts: {path: /ws, headers: {Host: a.example.org}}
+`)
+	if first.Fingerprint() == "" || first.Fingerprint() != again.Fingerprint() {
+		t.Fatalf("fingerprints %q and %q", first.Fingerprint(), again.Fingerprint())
+	}
+	if first.Fingerprint() == elsewhere.Fingerprint() {
+		t.Fatalf("a new server kept the fingerprint %q", first.Fingerprint())
+	}
+	trojan := fingerprint(map[string]any{"type": "trojan", "server": "example.com", "port": 443, "password": "secret", "sni": "a.example.org"})
+	if trojan == "" || trojan != fingerprint(map[string]any{"type": "trojan", "server": "example.com", "port": 443, "password": "secret", "sni": "b.example.org"}) {
+		t.Fatalf("an SNI changed the fingerprint %q", trojan)
+	}
+}
+
 func TestTheBuiltInProxiesHaveNoFingerprint(t *testing.T) {
 	data, err := json.Marshal(NewProxy(outbound.NewDirect()))
 	if err != nil {
