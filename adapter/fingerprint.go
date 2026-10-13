@@ -10,9 +10,10 @@ import (
 )
 
 // fingerprint identifies a node by how it connects, not by what it is called:
-// the description from the config without its name. Renaming a node keeps the
-// fingerprint, a new address, port, protocol or key changes it. encoding/json
-// writes map keys sorted, so the order of keys in the config does not matter.
+// the description from the config without its name and without the names it
+// shows on the wire (see disguiseKeys). Renaming a node keeps the fingerprint,
+// a new address, port, protocol or key changes it. encoding/json writes map
+// keys sorted, so the order of keys in the config does not matter.
 // A description that cannot be written as JSON has no fingerprint, and neither
 // has an entry that leads to no server (see leadsToAServer): a check through
 // it would tell nothing about a server.
@@ -22,7 +23,7 @@ func fingerprint(mapping map[string]any) string {
 	}
 	described := make(map[string]any, len(mapping))
 	for key, value := range mapping {
-		if key != "name" {
+		if key != "name" && !disguiseKeys[strings.ToLower(key)] {
 			described[key] = jsonable(value)
 		}
 	}
@@ -34,20 +35,31 @@ func fingerprint(mapping map[string]any) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// disguiseKeys are the TLS server name and the HTTP host a node shows on the
+// wire, at any depth of its description. Panels may pick them at random on
+// every fetch from a list or a wildcard, while the server behind stays the
+// same.
+var disguiseKeys = map[string]bool{"servername": true, "sni": true, "host": true}
+
 // jsonable turns the maps with untyped keys a YAML decoder may produce into
-// maps with string keys, which encoding/json can write.
+// maps with string keys, which encoding/json can write, leaving disguiseKeys
+// out.
 func jsonable(value any) any {
 	switch v := value.(type) {
 	case map[any]any:
 		m := make(map[string]any, len(v))
 		for key, inner := range v {
-			m[fmt.Sprint(key)] = jsonable(inner)
+			if name := fmt.Sprint(key); !disguiseKeys[strings.ToLower(name)] {
+				m[name] = jsonable(inner)
+			}
 		}
 		return m
 	case map[string]any:
 		m := make(map[string]any, len(v))
 		for key, inner := range v {
-			m[key] = jsonable(inner)
+			if !disguiseKeys[strings.ToLower(key)] {
+				m[key] = jsonable(inner)
+			}
 		}
 		return m
 	case []any:
