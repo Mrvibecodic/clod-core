@@ -15,6 +15,7 @@ const (
 	ProbeStageDial    = "подключение к узлу"
 	ProbeStageRequest = "запрос через узел"
 	ProbeStageStatus  = "код ответа"
+	ProbeStageStuck   = "соединение не закрылось в срок"
 )
 
 // ProbeResult is the outcome of a Proxy.URLTest run in held mode: it is kept
