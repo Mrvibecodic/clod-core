@@ -326,7 +326,8 @@ func alternateHosts(proxies []C.Proxy) []C.Proxy {
 const probeHedgeDelay = time.Second
 
 // ProbeHedgeDelay is probeHedgeDelay for callers of ProbeNode that budget a
-// probe: it may take ProbeHedgeDelay plus its timeout.
+// probe: it may take ProbeHedgeDelay plus its timeout, and probeAbandonGrace
+// more when a connection does not end by its deadline.
 const ProbeHedgeDelay = probeHedgeDelay
 
 // probeHedgeGrace is how long the first probe still gets once the second one
@@ -334,6 +335,10 @@ const ProbeHedgeDelay = probeHedgeDelay
 // starts, and then both answer at nearly the same moment: the first one is
 // only slower, not failed, and must not cost the node a failure in its history.
 const probeHedgeGrace = 250 * time.Millisecond
+
+// probeAbandonGrace is how long a probe may run past its deadline before it
+// is counted as failed without its answer.
+const probeAbandonGrace = time.Second
 
 // hedgeAt is when a live node whose last probe took elapsed gets its second
 // probe beside a first one that has not answered. A quick node gets it at the
@@ -489,8 +494,32 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 	ctx, held := C.WithHeldProbe(C.MarkProbePaced(base))
 	run.started = time.Now()
 	run.result = held
+	var once sync.Once
+	finish := func(stuck *C.ProbeResult) {
+		once.Do(func() {
+			if stuck != nil {
+				run.result = stuck
+			}
+			close(run.done)
+		})
+	}
+	// A connection that does not watch its deadline keeps its probe running
+	// past it: the probe counts as failed then, or it would hold the node, the
+	// check round and every later probe of the node until the core restarts.
+	abandon := time.AfterFunc(time.Until(deadline)+probeAbandonGrace, func() {
+		finish(&C.ProbeResult{
+			Held:    true,
+			Time:    time.Now(),
+			Err:     errProbeStuck,
+			Stage:   C.ProbeStageStuck,
+			Elapsed: time.Since(run.started),
+		})
+	})
 	go func() {
-		defer close(run.done)
+		defer func() {
+			abandon.Stop()
+			finish(nil)
+		}()
 		// The second probe waits for its turn in the background: an answer to
 		// the first one that comes meanwhile is taken at once. A wait that is
 		// cut short leaves the result unheld.
@@ -674,7 +703,8 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 // beside a stalled first one, a failure confirmed before the node is marked
 // dead, one probe per node at a time shared with any check already probing
 // it. ctx bounds the whole probe, timeout each of its (at most two) attempts,
-// so it may take ProbeHedgeDelay plus timeout. A probe that found nothing out
+// so it may take ProbeHedgeDelay plus timeout (see ProbeHedgeDelay for a
+// connection that does not end by its deadline). A probe that found nothing out
 // (ctx ended, the network was switching) returns ctx's error or
 // ErrProbeDiscarded and records nothing.
 func ProbeNode(ctx context.Context, p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], timeout time.Duration) (uint16, error) {
@@ -711,6 +741,7 @@ var (
 	// it ran while the network was switching or the process was paused.
 	ErrProbeDiscarded   = errors.New("probe discarded")
 	errProbeFailed      = errors.New("probe failed")
+	errProbeStuck       = errors.New("probe did not end by its deadline")
 	errUnexpectedStatus = errors.New("unexpected status code")
 )
 
