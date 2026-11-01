@@ -66,3 +66,32 @@ func TestAProbeThatOutlivesItsDeadlineDoesNotHoldTheNode(t *testing.T) {
 		t.Fatal("a node that answered stays dead")
 	}
 }
+
+func TestAProbeStuckUnderTheProbeHoldDoesNotMarkTheNodeDead(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	proxy := adapter.NewProxy(&stuckAdapter{ProxyAdapter: outbound.NewDirect(), stuck: 2, release: release})
+	const timeout = 300 * time.Millisecond
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), uint(timeout/time.Millisecond), 0, false, nil)
+	t.Cleanup(hc.close)
+
+	// The network is switching: probes stuck on its old connections are no
+	// failure of the node.
+	C.SetProbeHoldUntil(time.Now().Add(time.Minute))
+	t.Cleanup(func() { C.SetProbeHoldUntil(time.Time{}) })
+
+	round := make(chan struct{})
+	go func() {
+		hc.check()
+		close(round)
+	}()
+	select {
+	case <-round:
+	case <-time.After(probeHedgeDelay + timeout + probeAbandonGrace + 2*time.Second):
+		t.Fatal("the round waited for a probe past its deadline")
+	}
+	if !proxy.AliveForTestUrl(target.url()) {
+		t.Fatal("a node whose probes got stuck under the probe hold is marked dead")
+	}
+}

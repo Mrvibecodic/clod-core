@@ -513,6 +513,11 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 	// past it: the probe counts as failed then, or it would hold the node, the
 	// check round and every later probe of the node until the core restarts.
 	abandon := time.AfterFunc(time.Until(deadline)+probeAbandonGrace, func() {
+		// Under the probe hold it says nothing about the node, as in URLTest.
+		if C.ProbeHolding(run.started) || C.ProbeHolding(time.Now()) {
+			finish(&C.ProbeResult{})
+			return
+		}
 		finish(&C.ProbeResult{
 			Held:    true,
 			Time:    time.Now(),
