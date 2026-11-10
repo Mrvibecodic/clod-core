@@ -11,7 +11,10 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-var helloChrome155 = UClientHelloID{Client: utls.HelloChrome_133.Client, Version: "155"}
+var (
+	helloChrome155  = UClientHelloID{Client: utls.HelloChrome_133.Client, Version: "155"}
+	helloFirefox156 = UClientHelloID{Client: utls.HelloFirefox_148.Client, Version: "156"}
+)
 
 type helloUpdate struct {
 	base   UClientHelloID
@@ -19,7 +22,8 @@ type helloUpdate struct {
 }
 
 var helloUpdates = map[UClientHelloID]helloUpdate{
-	helloChrome155: {utls.HelloChrome_133, updateChrome155},
+	helloChrome155:  {utls.HelloChrome_133, updateChrome155},
+	helloFirefox156: {utls.HelloFirefox_148, updateFirefox156},
 }
 
 func UClient(c net.Conn, config *utls.Config, fingerprint UClientHelloID) *UConn {
@@ -71,5 +75,28 @@ func updateChrome155(spec *utls.ClientHelloSpec) {
 	randv2.Shuffle(len(extensions)-2, func(i, j int) {
 		extensions[i+1], extensions[j+1] = extensions[j+1], extensions[i+1]
 	})
+	spec.Extensions = extensions
+}
+
+func updateFirefox156(spec *utls.ClientHelloSpec) {
+	spec.CipherSuites = slices.DeleteFunc(spec.CipherSuites, func(suite uint16) bool {
+		return suite == utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA || suite == utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
+	})
+	extensions := make([]utls.TLSExtension, 0, len(spec.Extensions)+2)
+	for _, ext := range spec.Extensions {
+		extensions = append(extensions, ext)
+		switch ext := ext.(type) {
+		case *utls.SupportedCurvesExtension:
+			ext.Curves = slices.DeleteFunc(ext.Curves, func(curve utls.CurveID) bool {
+				return curve == 0x0100 || curve == 0x0101
+			})
+		case *utls.SupportedPointsExtension:
+			extensions = append(extensions, &utls.SessionTicketExtension{})
+		case *utls.SignatureAlgorithmsExtension:
+			extensions = append(extensions, &utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}})
+		case *utls.GREASEEncryptedClientHelloExtension:
+			ext.CandidatePayloadLens = []uint16{224}
+		}
+	}
 	spec.Extensions = extensions
 }

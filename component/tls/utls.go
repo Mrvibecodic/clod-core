@@ -73,7 +73,7 @@ var randomFingerprint = once.OnceValue(func() UClientHelloID {
 
 var fingerprints = map[string]UClientHelloID{
 	"chrome":  helloChrome155,
-	"firefox": utls.HelloFirefox_Auto,
+	"firefox": helloFirefox156,
 	"safari":  utls.HelloSafari_Auto,
 	"ios":     utls.HelloIOS_Auto,
 	"android": utls.HelloAndroid_11_OkHttp,
