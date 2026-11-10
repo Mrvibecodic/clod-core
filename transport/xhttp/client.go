@@ -243,6 +243,7 @@ type Client struct {
 }
 
 func NewClient(cfg *Config, makeTransport TransportMaker, makeDownloadTransport TransportMaker, hasReality bool) (*Client, error) {
+	makeTransport, makeDownloadTransport = CoalesceDials(makeTransport), CoalesceDials(makeDownloadTransport)
 	mode := cfg.EffectiveMode(hasReality)
 	switch mode {
 	case "stream-one", "stream-up", "packet-up":
