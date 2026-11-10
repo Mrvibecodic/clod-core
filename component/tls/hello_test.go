@@ -229,3 +229,51 @@ func TestOnlyTheListedHellosAreUpdated(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdatedHelloSurvivesTheRebuilds(t *testing.T) {
+	for _, name := range updatedHellos {
+		classical := builtHello(t, name, BuildRemovedX25519MLKEM768HandshakeState)
+		if groups := classical.keyShares(t); slices.Contains(groups, uint16(utls.X25519MLKEM768)) || !slices.Contains(groups, uint16(utls.X25519)) {
+			t.Fatalf("%s: key shares %04x", name, groups)
+		}
+		if groups := uint16s(classical.extension(t, 0x000a)[2:]); slices.Contains(groups, uint16(utls.X25519MLKEM768)) {
+			t.Fatalf("%s: supported groups %04x", name, groups)
+		}
+
+		websocket := builtHello(t, name, BuildWebsocketHandshakeState)
+		if alpn := websocket.extension(t, 0x0010); string(alpn) != "\x00\x09\x08http/1.1" {
+			t.Fatalf("%s: ALPN %q", name, alpn)
+		}
+	}
+}
+
+func TestUpdatedHelloWithoutAConfig(t *testing.T) {
+	for _, name := range updatedHellos {
+		fingerprint, _ := GetFingerprint(name)
+		if err := UClient(nil, nil, fingerprint).BuildHandshakeState(); err == nil {
+			t.Fatalf("%s: a hello was built without a server name", name)
+		}
+	}
+}
+
+func TestAHelloThatCannotBeUpdatedStaysTheOneItStartedFrom(t *testing.T) {
+	broken := UClientHelloID{Client: utls.HelloChrome_133.Client, Version: "broken"}
+	helloUpdates[broken] = helloUpdate{utls.HelloChrome_133, func(spec *utls.ClientHelloSpec) {
+		spec.Extensions = append(spec.Extensions, &utls.UtlsGREASEExtension{})
+	}}
+	t.Cleanup(func() { delete(helloUpdates, broken) })
+
+	uConn := UClient(nil, &utls.Config{ServerName: "example.com"}, broken)
+	if err := uConn.BuildHandshakeState(); err != nil {
+		t.Fatal(err)
+	}
+	base := utls.UClient(nil, &utls.Config{ServerName: "example.com"}, utls.HelloChrome_133)
+	if err := base.BuildHandshakeState(); err != nil {
+		t.Fatal(err)
+	}
+	ids := maskGREASE(parseHello(t, uConn.HandshakeState.Hello.Raw).ids())
+	want := maskGREASE(parseHello(t, base.HandshakeState.Hello.Raw).ids())
+	slices.Sort(ids)
+	slices.Sort(want)
+	assertUint16s(t, "extensions", ids, want)
+}
