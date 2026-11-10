@@ -193,7 +193,34 @@ func TestChromeHelloPermutesExtensionsEvenly(t *testing.T) {
 	}
 }
 
-var updatedHellos = []string{"chrome"}
+func TestFirefoxHelloIsFirefox156(t *testing.T) {
+	hello := builtHello(t, "firefox", (*UConn).BuildHandshakeState)
+
+	assertUint16s(t, "cipher suites", hello.ciphers, []uint16{
+		0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c,
+		0xc030, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+	})
+	assertUint16s(t, "extensions", hello.ids(), []uint16{
+		0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x0010, 0x0005, 0x0022,
+		0x0012, 0x0033, 0x002b, 0x000d, 0x002d, 0x001c, 0x001b, 0xfe0d,
+	})
+	assertUint16s(t, "supported groups", uint16s(hello.extension(t, 0x000a)[2:]), []uint16{
+		0x11ec, 0x001d, 0x0017, 0x0018, 0x0019,
+	})
+	assertUint16s(t, "key shares", hello.keyShares(t), []uint16{0x11ec, 0x001d, 0x0017})
+	if ticket := hello.extension(t, 0x0023); len(ticket) != 0 {
+		t.Fatalf("session ticket %x", ticket)
+	}
+	if modes := hello.extension(t, 0x002d); hex.EncodeToString(modes) != "0101" {
+		t.Fatalf("psk key exchange modes %x", modes)
+	}
+	// type, kdf, aead, config id, a 32 byte key and the payload, both with their length
+	if ech := hello.extension(t, 0xfe0d); len(ech) != 1+2+2+1+2+32+2+240 {
+		t.Fatalf("GREASE ECH takes %d bytes", len(ech))
+	}
+}
+
+var updatedHellos = []string{"chrome", "firefox"}
 
 func TestOnlyTheListedHellosAreUpdated(t *testing.T) {
 	for name, fingerprint := range fingerprints {
