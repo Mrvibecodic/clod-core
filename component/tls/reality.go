@@ -48,7 +48,7 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			VerifyConnection:       verifier.VerifyConnection,
 		}
 
-		uConn := utls.UClient(conn, uConfig, fingerprint)
+		uConn := UClient(conn, uConfig, fingerprint)
 		verifier.UConn = uConn
 		err := uConn.BuildHandshakeState()
 		if err != nil {

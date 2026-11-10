@@ -52,7 +52,7 @@ func newUTLSClient(ctx context.Context, conn net.Conn, config *ClientConfig) (ne
 	// Resumption would require recalculating PSK binders after replacing the
 	// ClientHello random. uTLS does not expose a hook for that operation, so this
 	// client deliberately disables session tickets and 0-RTT.
-	uConn := utls.UClient(conn, &utls.Config{
+	uConn := tlsC.UClient(conn, &utls.Config{
 		ServerName: config.ServerName,
 		NextProtos: append([]string(nil), alpn...),
 		// JLS authenticates the server in VerifyConnection. TLS still verifies
