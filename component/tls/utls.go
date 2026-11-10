@@ -27,10 +27,6 @@ func Client(c net.Conn, config *utls.Config) *Conn {
 	return utls.Client(c, config)
 }
 
-func UClient(c net.Conn, config *utls.Config, fingerprint UClientHelloID) *UConn {
-	return utls.UClient(c, config, fingerprint)
-}
-
 func Server(c net.Conn, config *utls.Config) *Conn {
 	return utls.Server(c, config)
 }
@@ -76,7 +72,7 @@ var randomFingerprint = once.OnceValue(func() UClientHelloID {
 })
 
 var fingerprints = map[string]UClientHelloID{
-	"chrome":  utls.HelloChrome_Auto,
+	"chrome":  helloChrome155,
 	"firefox": utls.HelloFirefox_Auto,
 	"safari":  utls.HelloSafari_Auto,
 	"ios":     utls.HelloIOS_Auto,
