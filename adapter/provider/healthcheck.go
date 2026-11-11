@@ -466,30 +466,49 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 		// timeout.
 		deadline = first.started.Add(probeHedgeDelay + hc.timeout)
 	}
-	base, cancel := context.WithDeadline(hc.ctx, deadline)
+	base, cancel := context.WithCancel(hc.ctx)
 	if hedge {
 		// A caller that paced its probe paced the first one only.
 		base = C.UnmarkProbePaced(base)
 	}
 	run := &probeRun{result: &C.ProbeResult{}, done: make(chan struct{}), cancel: cancel}
-	pace := func(ctx context.Context) error { return C.ProbePace(ctx, C.ProbeHostOf(p)) }
-	if !hedge {
-		paceCtx := base
-		if until, ok := hc.ctx.Deadline(); ok {
-			// A caller's deadline bounds the whole probe: the wait for a turn
-			// leaves it the hedge delay, a timeout and the grace, or a second
-			// probe failing at the deadline would be taken for a cancel.
-			var cancelPace context.CancelFunc
-			paceCtx, cancelPace = context.WithDeadline(base, until.Add(C.ProbeReserve-probeHedgeDelay-hc.timeout-probeHedgeGrace))
-			defer cancelPace()
+	// turn waits for the probe's turn to the host. A caller's deadline bounds
+	// the whole probe: the wait comes out of the probe's own time and is cut
+	// short to leave it ProbeReserve. A check without one, the scheduled
+	// check, waits for the turn in full and the probe's time starts after it:
+	// cut short, the probes that did not fit went out together, all of them
+	// at a timeout of ProbeReserve or less, and a slow node of a busy host
+	// was left too little of its timeout to answer.
+	until, bounded := hc.ctx.Deadline()
+	turn := func() error {
+		ctx := base
+		if bounded {
+			limit := deadline
+			// The wait of the first probe leaves the caller the hedge delay,
+			// a timeout and the grace, or a second probe failing at the
+			// deadline would be taken for a cancel.
+			if latest := until.Add(C.ProbeReserve - probeHedgeDelay - hc.timeout - probeHedgeGrace); !hedge && latest.Before(limit) {
+				limit = latest
+			}
+			var stop context.CancelFunc
+			ctx, stop = context.WithDeadline(base, limit)
+			defer stop()
 		}
-		if err := pace(paceCtx); err != nil {
-			// The check was cancelled while the probe waited for its turn:
-			// nothing ran, the result stays unheld.
-			run.started = time.Now()
-			close(run.done)
-			return run
+		asked := time.Now()
+		if err := C.ProbePace(ctx, C.ProbeHostOf(p)); err != nil {
+			return err
 		}
+		if !bounded {
+			deadline = deadline.Add(time.Since(asked))
+		}
+		return nil
+	}
+	if !hedge && turn() != nil {
+		// The check was cancelled while the probe waited for its turn:
+		// nothing ran, the result stays unheld.
+		run.started = time.Now()
+		close(run.done)
+		return run
 	}
 	ctx, held := C.WithHeldProbe(C.MarkProbePaced(base))
 	run.started = time.Now()
@@ -503,29 +522,29 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 			close(run.done)
 		})
 	}
-	// A connection that does not watch its deadline keeps its probe running
-	// past it: the probe counts as failed then, or it would hold the node, the
-	// check round and every later probe of the node until the core restarts.
-	abandon := time.AfterFunc(time.Until(deadline)+probeAbandonGrace, func() {
-		finish(&C.ProbeResult{
-			Held:    true,
-			Time:    time.Now(),
-			Err:     errProbeStuck,
-			Stage:   C.ProbeStageStuck,
-			Elapsed: time.Since(run.started),
-		})
-	})
 	go func() {
-		defer func() {
-			abandon.Stop()
-			finish(nil)
-		}()
+		defer finish(nil)
 		// The second probe waits for its turn in the background: an answer to
 		// the first one that comes meanwhile is taken at once. A wait that is
 		// cut short leaves the result unheld.
-		if hedge && pace(base) != nil {
+		if hedge && turn() != nil {
 			return
 		}
+		ctx, stop := context.WithDeadline(ctx, deadline)
+		defer stop()
+		// A connection that does not watch its deadline keeps its probe running
+		// past it: the probe counts as failed then, or it would hold the node, the
+		// check round and every later probe of the node until the core restarts.
+		abandon := time.AfterFunc(time.Until(deadline)+probeAbandonGrace, func() {
+			finish(&C.ProbeResult{
+				Held:    true,
+				Time:    time.Now(),
+				Err:     errProbeStuck,
+				Stage:   C.ProbeStageStuck,
+				Elapsed: time.Since(run.started),
+			})
+		})
+		defer abandon.Stop()
 		_, _ = p.URLTest(ctx, url, expectedStatus)
 	}()
 	return run

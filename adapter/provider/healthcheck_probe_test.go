@@ -29,6 +29,7 @@ type probeTarget struct {
 	held     []net.Conn
 	conns    int
 	firstAt  time.Time
+	at       []time.Time
 }
 
 func newProbeTarget(t *testing.T, slow time.Duration, plan ...string) *probeTarget {
@@ -68,6 +69,7 @@ func (pt *probeTarget) serve() {
 		if n == 0 {
 			pt.firstAt = time.Now()
 		}
+		pt.at = append(pt.at, time.Now())
 		pt.conns++
 		action := "ok"
 		if n < len(pt.plan) {
@@ -685,5 +687,107 @@ func TestProbeNodeJudgesAStalledNodeWithinTheCallersDeadline(t *testing.T) {
 	_, err := ProbeNode(ctx, proxy, target.url(), nil, attempt)
 	if ctx.Err() != nil || errors.Is(err, ErrProbeDiscarded) || proxy.AliveForTestUrl(target.url()) {
 		t.Fatalf("no verdict within the deadline: %v after %s, alive %t", err, time.Since(began), proxy.AliveForTestUrl(target.url()))
+	}
+}
+
+// closest is the least time between two connections to the target.
+func (pt *probeTarget) closest() time.Duration {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	least := time.Duration(-1)
+	for i := 1; i < len(pt.at); i++ {
+		if gap := pt.at[i].Sub(pt.at[i-1]); least < 0 || gap < least {
+			least = gap
+		}
+	}
+	return least
+}
+
+func nodesOnOneHost(t *testing.T, target *probeTarget, nodes int) []C.Proxy {
+	t.Helper()
+	proxies := make([]C.Proxy, 0, nodes)
+	for i := 0; i < nodes; i++ {
+		node, err := outbound.NewHttp(outbound.HttpOption{
+			Name:   fmt.Sprintf("node-%d", i),
+			Server: "127.0.0.1",
+			Port:   target.port(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxies = append(proxies, adapter.NewProxy(node))
+	}
+	return proxies
+}
+
+// The scheduled check has no caller waiting for it: its probes wait for their
+// turns to the host in full, so a short timeout does not turn the round into
+// a burst.
+func TestTheScheduledCheckSpacesProbesAtAShortTimeout(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	const nodes = 6
+	proxies := nodesOnOneHost(t, target, nodes)
+	hc := NewHealthCheck(proxies, target.url(), 1000, 0, false, nil)
+	t.Cleanup(hc.close)
+	hc.check()
+	if target.connections() != nodes {
+		t.Fatalf("every node gets one probe, saw %d connections", target.connections())
+	}
+	if least := target.closest(); least < C.ProbeSpacing-50*time.Millisecond {
+		t.Fatalf("two probes to one host came %s apart, the spacing is %s", least, C.ProbeSpacing)
+	}
+}
+
+// The second probes take their turns to the host as well: started beside the
+// stalled first ones without waiting, they landed on the turns of other nodes.
+func TestTheSecondProbesOfTheScheduledCheckTakeTheirTurns(t *testing.T) {
+	const nodes = 8
+	plan := make([]string, nodes)
+	for i := range plan {
+		plan[i] = "stall"
+	}
+	target := newProbeTarget(t, 0, plan...)
+	proxies := nodesOnOneHost(t, target, nodes)
+	hc := NewHealthCheck(proxies, target.url(), 1000, 0, false, nil)
+	t.Cleanup(hc.close)
+	hc.check()
+	if target.connections() != 2*nodes {
+		t.Fatalf("every node gets a second probe, saw %d connections", target.connections())
+	}
+	if least := target.closest(); least < C.ProbeSpacing-50*time.Millisecond {
+		t.Fatalf("two probes to one host came %s apart, the spacing is %s", least, C.ProbeSpacing)
+	}
+	for _, p := range proxies {
+		if !p.AliveForTestUrl(target.url()) {
+			t.Fatalf("%s answered its second probe and is alive", p.Name())
+		}
+	}
+}
+
+// A probe of the scheduled check that waited for its turn still has its whole
+// timeout: taken out of it, the wait left a slow node of a busy host too
+// little time to answer.
+func TestAScheduledProbeKeepsItsTimeoutAfterTheWaitForItsTurn(t *testing.T) {
+	const timeout = C.ProbeReserve + 400*time.Millisecond
+	target := newProbeTarget(t, timeout-200*time.Millisecond, "slow", "slow")
+	proxies := nodesOnOneHost(t, target, 1)
+	hc := NewHealthCheck(proxies, target.url(), uint(timeout/time.Millisecond), 0, false, nil)
+	t.Cleanup(hc.close)
+	// Other nodes of the host hold its next two turns.
+	var booked sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		booked.Add(1)
+		go func() {
+			defer booked.Done()
+			_ = C.ProbePace(context.Background(), "127.0.0.1")
+		}()
+	}
+	t.Cleanup(booked.Wait)
+	time.Sleep(50 * time.Millisecond)
+	// The node answers its first probe within the timeout: it passes on that
+	// answer, not on the second probe's.
+	outcome, _ := hc.probe(proxies[0], target.url(), nil)
+	if outcome != probePassed {
+		t.Fatalf("the node answered its first probe within the timeout, outcome %d", outcome)
 	}
 }
