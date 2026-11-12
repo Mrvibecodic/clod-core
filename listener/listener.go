@@ -60,7 +60,7 @@ var (
 	vmessMux   sync.Mutex
 	tuicMux    sync.Mutex
 
-	LastTunConf  LC.Tun
+	lastTunConf  LC.Tun
 	LastTuicConf LC.TuicServer
 )
 
@@ -76,7 +76,7 @@ type Ports struct {
 
 func GetTunConf() LC.Tun {
 	if tunLister == nil {
-		return LastTunConf
+		return lastTunConf
 	}
 	return tunLister.Config()
 }
@@ -496,11 +496,20 @@ func ReCreateMixed(port int, tunnel C.Tunnel) {
 }
 
 func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
+	PatchTun(func(LC.Tun) LC.Tun { return tunConf }, tunnel)
+}
+
+// PatchTun меняет настройки туннеля, применённые последними. Они читаются под
+// тем же замком, что держит пересоздание: изменение, пришедшее посреди
+// создания устройства, исходит из настроек, которые сейчас применяются, а не
+// из прежних — иначе оно закрывало бы только что созданный туннель.
+func PatchTun(patch func(last LC.Tun) LC.Tun, tunnel C.Tunnel) {
+	tunMux.Lock()
+	tunConf := patch(lastTunConf)
 	tunConf.Sort()
 
-	tunMux.Lock()
 	defer func() {
-		LastTunConf = tunConf
+		lastTunConf = tunConf
 		tunMux.Unlock()
 	}()
 
@@ -512,7 +521,7 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 		}
 	}()
 
-	if tunConf.Equal(LastTunConf) {
+	if tunConf.Equal(lastTunConf) {
 		if tunLister != nil { // some default value in dialer maybe changed when config reload, reset at here
 			tunLister.OnReload()
 		}
