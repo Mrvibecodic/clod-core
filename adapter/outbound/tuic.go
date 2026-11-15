@@ -25,6 +25,7 @@ type Tuic struct {
 	*Base
 	option *TuicOption
 	client *tuic.PoolClient
+	wake   wakeGuard
 
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
@@ -77,6 +78,7 @@ func (t *Tuic) ResetNetwork() {
 }
 
 func (t *Tuic) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	t.wake.renew(t.name, t.ResetNetwork)
 	conn, err := t.client.DialContext(ctx, metadata)
 	if err != nil {
 		return nil, err
@@ -109,6 +111,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 			return NewPacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination}), t), nil
 		}
 	}
+	t.wake.renew(t.name, t.ResetNetwork)
 	pc, err := t.client.ListenPacket(ctx, metadata)
 	if err != nil {
 		return nil, err

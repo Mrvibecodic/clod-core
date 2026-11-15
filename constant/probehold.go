@@ -20,6 +20,9 @@ var (
 	// probeLastBeat is wall clock nanoseconds: the monotonic clock stops during
 	// sleep, and a stale beat is exactly how sleep is detected here.
 	probeLastBeat atomic.Int64
+	// probeWokeFrom names the last sleep found by the beat it was found after,
+	// 0 if none.
+	probeWokeFrom atomic.Int64
 )
 
 func SetProbeHoldUntil(until time.Time) {
@@ -41,6 +44,10 @@ func CapProbeHoldUntil(until time.Time) {
 }
 
 func ProbeBeat(nanos int64) {
+	from := probeWokeFrom.Load()
+	if last := probeLastBeat.Load(); last != 0 && nanos-last > int64(ProbeFreezeGap) {
+		probeWokeFrom.CompareAndSwap(from, last)
+	}
 	probeLastBeat.Store(nanos)
 }
 
@@ -54,10 +61,19 @@ func ProbeHolding(at time.Time) bool {
 		return true
 	}
 
+	return probeWoke(at)
+}
+
+func probeWoke(at time.Time) bool {
+	from := probeWokeFrom.Load()
 	beat := probeLastBeat.Load()
 	if beat == 0 || at.UnixNano()-beat <= int64(ProbeFreezeGap) {
 		return false
 	}
+
+	// Named before the beat turns fresh: whoever sees a fresh beat then sees
+	// this sleep as well.
+	probeWokeFrom.CompareAndSwap(from, beat)
 
 	// The first one to find the process awake after a sleep starts the hold
 	// from now: waiting for the next heartbeat stretched it by up to its
@@ -68,4 +84,14 @@ func ProbeHolding(at time.Time) bool {
 	}
 
 	return true
+}
+
+// ProbeWake names the last sleep found, looking for one first; it changes with
+// every sleep. A session with a peer does not outlive a sleep: the peer drops
+// it on its own clock, while the timers that would notice that here stood
+// still.
+func ProbeWake() int64 {
+	probeWoke(time.Now())
+
+	return probeWokeFrom.Load()
 }

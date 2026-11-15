@@ -34,6 +34,7 @@ type Hysteria2 struct {
 
 	option *Hysteria2Option
 	client *hysteria2.Client
+	wake   wakeGuard
 }
 
 type Hysteria2Option struct {
@@ -90,6 +91,7 @@ type Hysteria2RealmOption struct {
 }
 
 func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	h.wake.renew(h.name, h.ResetNetwork)
 	c, err := h.client.DialConn(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
 		return nil, err
@@ -101,6 +103,7 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
+	h.wake.renew(h.name, h.ResetNetwork)
 	pc, err := h.client.ListenPacket(ctx)
 	if err != nil {
 		return nil, err
