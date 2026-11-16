@@ -14,6 +14,7 @@ type measuredProxy struct {
 	delay    uint16
 	alive    bool
 	provider string
+	probes   []C.DelayHistory
 }
 
 func (p *measuredProxy) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{ProviderName: p.provider} }
@@ -21,7 +22,7 @@ func (p *measuredProxy) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{ProviderNam
 func (p *measuredProxy) Name() string                                   { return p.name }
 func (p *measuredProxy) AliveForTestUrl(string) bool                    { return p.alive }
 func (p *measuredProxy) LastDelayForTestUrl(string) uint16              { return p.delay }
-func (p *measuredProxy) DelayHistoryForTestUrl(string) []C.DelayHistory { return nil }
+func (p *measuredProxy) DelayHistoryForTestUrl(string) []C.DelayHistory { return p.probes }
 
 type measuredProvider struct {
 	P.ProxyProvider

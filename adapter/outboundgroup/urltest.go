@@ -146,14 +146,7 @@ func (u *URLTest) score(p C.Proxy) uint32 {
 	if delay >= 0xffff {
 		return delay
 	}
-	var history []C.DelayHistory
-	if h, ok := p.(interface {
-		DelayHistoryForTestUrl(url string) []C.DelayHistory
-	}); ok {
-		history = h.DelayHistoryForTestUrl(u.testUrl)
-	} else {
-		history = p.ExtraDelayHistories()[u.testUrl].History
-	}
+	history := probeHistory(p, u.testUrl)
 	var failures uint32
 	for i := len(history) - 1; i >= 0 && i >= len(history)-flakyWindow; i-- {
 		if history[i].Delay == 0 {

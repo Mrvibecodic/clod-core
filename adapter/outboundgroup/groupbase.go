@@ -437,6 +437,8 @@ func (gb *GroupBase) healthCheck() {
 const (
 	reviveFirstWait = 30 * time.Second
 	reviveMaxWait   = 10 * time.Minute
+	// reviveRetryWait is how long a check that has just ended is not repeated.
+	reviveRetryWait = time.Second
 )
 
 // onDeadNodeDialed is told of a connection through p that worked. A group
@@ -446,9 +448,11 @@ const (
 // checked at once. The next such check waits reviveFirstWait; a check that
 // leaves p dead doubles the wait, up to reviveMaxWait, so that a node that
 // carries traffic but fails its probes does not have the group probed over
-// and over.
+// and over. A check that did not reach p is no such check: one of the group
+// that is already running probes p itself, and one asked for right after
+// another has ended is asked for once more.
 func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
-	if p.AliveForTestUrl(testUrl) {
+	if p.AliveForTestUrl(testUrl) || gb.failedTesting.Load() {
 		return
 	}
 	gb.reviveMux.Lock()
@@ -466,16 +470,45 @@ func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
 
 	log.Infoln("[Проба] %s: соединение через %s прошло, а узел помечен мёртвым — группа перепроверяется", gb.Name(), p.Name())
 	go func() {
+		probed := lastProbe(p, testUrl)
 		fn()
+		if !p.AliveForTestUrl(testUrl) && lastProbe(p, testUrl).Equal(probed) {
+			time.Sleep(reviveRetryWait)
+			fn()
+		}
 		gb.reviveMux.Lock()
 		defer gb.reviveMux.Unlock()
-		if p.AliveForTestUrl(testUrl) {
+		switch {
+		case p.AliveForTestUrl(testUrl):
 			gb.reviveWait = reviveFirstWait
-		} else if gb.reviveWait *= 2; gb.reviveWait > reviveMaxWait {
-			gb.reviveWait = reviveMaxWait
+		case !lastProbe(p, testUrl).Equal(probed):
+			// A check that did not reach p either time found nothing out:
+			// only one that left p dead makes the wait longer.
+			if gb.reviveWait *= 2; gb.reviveWait > reviveMaxWait {
+				gb.reviveWait = reviveMaxWait
+			}
 		}
 		gb.reviveNext = time.Now().Add(gb.reviveWait)
 	}()
+}
+
+// probeHistory is what the checks recorded of p at url.
+func probeHistory(p C.Proxy, url string) []C.DelayHistory {
+	if h, ok := p.(interface {
+		DelayHistoryForTestUrl(url string) []C.DelayHistory
+	}); ok {
+		return h.DelayHistoryForTestUrl(url)
+	}
+	return p.ExtraDelayHistories()[url].History
+}
+
+// lastProbe is when p was last probed at url, zero if it never was.
+func lastProbe(p C.Proxy, url string) time.Time {
+	history := probeHistory(p, url)
+	if len(history) == 0 {
+		return time.Time{}
+	}
+	return history[len(history)-1].Time
 }
 
 func (gb *GroupBase) onDialSuccess() {
