@@ -84,17 +84,19 @@ func (u *URLTest) ForceSet(name string) {
 
 // DialContext implements C.ProxyAdapter
 func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
+	// Before the node is taken: a connection that took its node before the
+	// group went to another is the older of the two.
+	born := time.Now()
 	proxy := u.fast(true)
 	// A node marked dead while the connection was being opened says nothing
 	// against the mark: only one known dead when the group took it does, and
 	// only by an answer through it.
 	dead := !proxy.AliveForTestUrl(u.testUrl)
-	born := time.Now()
 	c, err = proxy.DialContext(ctx, metadata)
 	if err == nil {
 		c.AppendToChains(u)
 	} else {
-		u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy))
+		u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy, born))
 	}
 
 	if N.NeedHandshake(c) {
@@ -102,7 +104,7 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 			if err == nil {
 				u.onDialSuccess()
 			} else {
-				u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy))
+				u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy, born))
 			}
 		})
 	}
@@ -119,12 +121,13 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 
 // ListenPacketContext implements C.ProxyAdapter
 func (u *URLTest) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	born := time.Now()
 	proxy := u.fast(true)
 	pc, err := proxy.ListenPacketContext(ctx, metadata)
 	if err == nil {
 		pc.AppendToChains(u)
 	} else {
-		u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy))
+		u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy, born))
 	}
 
 	return pc, err
@@ -169,8 +172,8 @@ func (u *URLTest) doubt() doubt {
 }
 
 // checkAfter is the check the failed connections through p ask for.
-func (u *URLTest) checkAfter(p C.Proxy) func() {
-	return func() { u.failedOf(p, u.doubt()) }
+func (u *URLTest) checkAfter(p C.Proxy, born time.Time) func() {
+	return func() { u.failedOf(p, born, u.doubt()) }
 }
 
 // nextNodes is the alive nodes of the group without the given one, the best
