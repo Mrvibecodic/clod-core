@@ -439,6 +439,26 @@ func witnesses(p C.Proxy, next []C.Proxy) []C.Proxy {
 	return picked
 }
 
+// failedOf answers the connections through p that failed. A group that is on
+// a dead node already has every node checked, as it always had: there is
+// nothing to lose, and the nodes that are back are found.
+func (gb *GroupBase) failedOf(p C.Proxy, d doubt) {
+	if !p.AliveForTestUrl(d.url) {
+		d.all()
+		return
+	}
+	s := &gb.silence
+	s.mu.Lock()
+	start := !s.asking && !time.Now().Before(s.failedQuietUntil)
+	if start {
+		s.asking = true
+	}
+	s.mu.Unlock()
+	if start {
+		gb.askOf(p, d, true)
+	}
+}
+
 // askOf answers the connections p failed or left unanswered. It probes p and
 // a few nodes the group would go to, at once, and writes nothing down until
 // it has their answers:

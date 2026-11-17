@@ -247,6 +247,87 @@ func TestNoAskingWhileTheGroupIsChecked(t *testing.T) {
 	}
 }
 
+func failures(gb *GroupBase) int {
+	gb.failedTestMux.Lock()
+	defer gb.failedTestMux.Unlock()
+	return gb.failedTimes
+}
+
+// Failed connections through a node ask about it the same way: with nobody
+// answering nothing is written and the group is not checked, and the
+// failures of those seconds are answered.
+func TestFailedConnectionsWithNobodyAnsweringMarkNothing(t *testing.T) {
+	a, b, c := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", false), askedNode("C", "192.0.2.3", false)
+	gb, provider, d := askedGroup(a, b, c)
+	gb.failedTimes = 3
+	gb.failedOf(a, d)
+	if a.dead.Load() || b.dead.Load() || c.dead.Load() || a.records()+b.records()+c.records() != 0 {
+		t.Fatal("failed connections with the network down marked a node")
+	}
+	if provider.checks.Load() != 0 {
+		t.Fatal("the whole group was checked")
+	}
+	if failures(gb) != 0 {
+		t.Fatal("the failures counted before the answer were kept")
+	}
+	asks := a.asks.Load()
+	gb.failedOf(a, d)
+	if a.asks.Load() != asks {
+		t.Fatal("asked again within the pause")
+	}
+}
+
+// A node whose connections fail beside one that answers is dead.
+func TestFailedConnectionsBesideAnAnsweringNodeMarkTheNodeDead(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
+	gb, provider, d := askedGroup(a, b)
+	gb.failedOf(a, d)
+	if !a.dead.Load() || b.dead.Load() || provider.checks.Load() != 0 {
+		t.Fatalf("dead: the node %v, the other %v; checks of the group %d", a.dead.Load(), b.dead.Load(), provider.checks.Load())
+	}
+}
+
+// A node that answers while its connections fail is asked about again soon,
+// and later each time in a row: its wait starts short and stops at the pause
+// of a silent site, whatever that pause has grown to.
+func TestANodeThatAnswersWhileItsConnectionsFailIsAskedAgainSoon(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
+	gb, _, d := askedGroup(a, b)
+	wait := func() time.Duration {
+		gb.silence.mu.Lock()
+		defer gb.silence.mu.Unlock()
+		return time.Until(gb.silence.failedQuietUntil).Round(time.Second)
+	}
+	for _, want := range []time.Duration{silenceAfter, 2 * silenceAfter, 4 * silenceAfter, 8 * silenceAfter, silencePause, silencePause} {
+		gb.failedOf(a, d)
+		if got := wait(); got != want {
+			t.Fatalf("asked again in %s, want %s", got, want)
+		}
+		gb.silence.mu.Lock()
+		gb.silence.failedQuietUntil = time.Time{}
+		gb.silence.mu.Unlock()
+	}
+	if a.records() != 0 {
+		t.Fatal("the answer was written down")
+	}
+	gb.noteAnswer(a, time.Now())
+	gb.failedOf(a, d)
+	if got := wait(); got != silenceAfter {
+		t.Fatalf("after an answered connection asked again in %s, want %s", got, silenceAfter)
+	}
+}
+
+// A group that is on a dead node already has every node checked.
+func TestFailedConnectionsThroughADeadNodeCheckTheWholeGroup(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
+	a.dead.Store(true)
+	gb, provider, d := askedGroup(a, b)
+	gb.failedOf(a, d)
+	if provider.checks.Load() != 1 || a.asks.Load() != 0 {
+		t.Fatalf("checks of the group %d, the node asked %d times", provider.checks.Load(), a.asks.Load())
+	}
+}
+
 // A node that needed its second try where a node beside it answered at the
 // first is unsteady: that is written to it, and to it alone, and it stays
 // alive.
@@ -273,6 +354,22 @@ func TestSecondTriesAllRoundLeaveNothingWritten(t *testing.T) {
 	gb.askOf(a, d, false)
 	if a.records() != 0 || b.records() != 0 {
 		t.Fatalf("written %d and %d, want nothing", a.records(), b.records())
+	}
+}
+
+// A site that keeps silent has the group wait before it asks about the node
+// again; a node that then refuses connections is asked about all the same.
+func TestThePauseOfASilentSiteDoesNotHoldFailedConnections(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
+	gb, _, d := askedGroup(a, b)
+	gb.askOf(a, d, false)
+	if !quiet(gb) {
+		t.Fatal("no pause after a node found alive")
+	}
+	a.answers.Store(false)
+	gb.failedOf(a, d)
+	if !a.dead.Load() {
+		t.Fatal("failed connections were not answered within the pause of the silent site")
 	}
 }
 

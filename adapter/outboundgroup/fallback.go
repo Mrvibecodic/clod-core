@@ -41,7 +41,7 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 	if err == nil {
 		c.AppendToChains(f)
 	} else {
-		f.onDialFailed(proxy.Type(), err, f.healthCheck)
+		f.onDialFailed(proxy.Type(), err, f.checkAfter(proxy))
 	}
 
 	if N.NeedHandshake(c) {
@@ -49,7 +49,7 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 			if err == nil {
 				f.onDialSuccess()
 			} else {
-				f.onDialFailed(proxy.Type(), err, f.healthCheck)
+				f.onDialFailed(proxy.Type(), err, f.checkAfter(proxy))
 			}
 		})
 	}
@@ -121,6 +121,11 @@ func (f *Fallback) doubt() doubt {
 	return doubt{url: f.testUrl, expected: f.expectedStatus, all: f.healthCheck, next: func(but C.Proxy) []C.Proxy {
 		return aliveBut(f.GetProxies(false), but, f.testUrl)
 	}}
+}
+
+// checkAfter is the check the failed connections through p ask for.
+func (f *Fallback) checkAfter(p C.Proxy) func() {
+	return func() { f.failedOf(p, f.doubt()) }
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
