@@ -293,6 +293,27 @@ func TestANewerProbeOfTheNodeStandsOverTheAnswer(t *testing.T) {
 	}
 }
 
+// A newer probe that leaves the node alive means the answer found nothing
+// out: the node is not taken for dead, and the nodes beside it are left as
+// they were.
+func TestAnAnswerOverANewerProbeIsNoVerdict(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
+	var once sync.Once
+	a.during = func() {
+		once.Do(func() {
+			a.RecordProbe("", &C.ProbeResult{Held: true, Time: time.Now(), Delay: 10, Satisfied: true})
+		})
+	}
+	gb, _, d := askedGroup(a, b)
+	gb.askOf(a, d, false)
+	if b.records() != 0 {
+		t.Fatalf("written to the node beside: %d", b.records())
+	}
+	if gb.rechecks.Load() != 0 {
+		t.Fatal("the node was taken for one the group left")
+	}
+}
+
 // A check of the whole group that did not start, another one was running,
 // found nothing out: it leaves no pause.
 func TestACheckOfTheGroupThatDidNotStartLeavesNoPause(t *testing.T) {
