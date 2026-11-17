@@ -165,6 +165,31 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		u.hiddenGeneration.Store(generation)
 		u.fastSingle.Reset()
 	}
+	elm, shared := u.pick(touch)
+	// The choice is kept for ten seconds: a node marked dead meanwhile is
+	// left at once, not when the kept choice runs out.
+	if elm != nil && !elm.AliveForTestUrl(u.testUrl) && anyAlive(u.GetProxies(false), u.testUrl) {
+		u.fastSingle.Reset()
+		elm, shared = u.pick(touch)
+	}
+	if shared && touch { // a shared fastSingle.Do() may cause providers untouched, so we touch them again
+		u.Touch()
+	}
+
+	return elm
+}
+
+// anyAlive reports whether the list has an alive node.
+func anyAlive(proxies []C.Proxy, url string) bool {
+	for _, proxy := range proxies {
+		if proxy.AliveForTestUrl(url) {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *URLTest) pick(touch bool) (C.Proxy, bool) {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		u.fastMu.Lock()
 		defer u.fastMu.Unlock()
@@ -223,18 +248,20 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 			}
 
 		}
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) {
+		if u.fastNode == nil || fastNotExist {
 			u.fastNode = fast
+		} else if !u.fastNode.AliveForTestUrl(u.testUrl) {
+			// With every node dead there is nowhere to go: the group stays
+			// where it is rather than move to the first of the list.
+			if fast.AliveForTestUrl(u.testUrl) {
+				u.fastNode = fast
+			}
 		} else if u.score(u.fastNode) > minScore+uint32(u.tolerance) {
 			u.fastNode = fast
 		}
 		return u.fastNode, nil
 	})
-	if shared && touch { // a shared fastSingle.Do() may cause providers untouched, so we touch them again
-		u.Touch()
-	}
-
-	return elm
+	return elm, shared
 }
 
 // SupportUDP implements C.ProxyAdapter
