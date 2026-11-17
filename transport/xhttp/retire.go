@@ -131,3 +131,9 @@ func closeWhenIdle(owner any, entries []*reuseEntry, step time.Duration, closed 
 func (c *Client) Retire() bool {
 	return retire(c, c.ctx.Done(), c.uploadManager, c.downloadManager)
 }
+
+// Pooled reports whether the client keeps a pool of connections for its
+// sessions.
+func (c *Client) Pooled() bool {
+	return c.uploadManager != nil || c.downloadManager != nil
+}

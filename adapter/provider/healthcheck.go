@@ -348,19 +348,39 @@ const probeAbandonGrace = time.Second
 
 // hedgeAt is when a live node whose last probe took elapsed gets its second
 // probe beside a first one that has not answered. A quick node gets it at the
-// hedge delay. A slow node (the whole probe counts: the dial and the
+// hedge delay, or at half the timeout if it keeps shared connections (keeps):
+// a new stream of such a node opens no new connection, so there is no lost
+// connect packet to hedge against early, and the second probe sets its
+// connections aside. It has to answer a stall, not a slow moment under load.
+// A slow node (the whole probe counts: the dial and the
 // handshake, not only the unified delay) gets it at twice its usual time, so
 // that a normal answer comes before it and one probe a round is enough, but
 // never so late that the second probe has less than one and a half of that
 // time left: the probe as a whole still ends by the hedge delay and a timeout,
-// the budget callers of ProbeNode count on.
-func (hc *HealthCheck) hedgeAt(elapsed time.Duration) time.Duration {
+// the budget callers of ProbeNode count on. A slow node that keeps shared
+// connections gets it no earlier than at half the timeout either, within
+// that same bound, so that it never has its connections set aside sooner
+// than a quicker node would.
+func (hc *HealthCheck) hedgeAt(elapsed time.Duration, keeps bool) time.Duration {
 	if elapsed < probeHedgeDelay {
+		if keeps && hc.timeout/2 > probeHedgeDelay {
+			return hc.timeout / 2
+		}
 		return probeHedgeDelay
 	}
 	at := 2 * elapsed
-	if latest := probeHedgeDelay + hc.timeout - elapsed*3/2; latest < at {
+	latest := probeHedgeDelay + hc.timeout - elapsed*3/2
+	if latest < at {
 		at = latest
+	}
+	if keeps {
+		half := hc.timeout / 2
+		if latest < half {
+			half = latest
+		}
+		if at < half {
+			at = half
+		}
 	}
 	if at < probeHedgeDelay {
 		at = probeHedgeDelay
@@ -577,6 +597,13 @@ func retireConns(p C.Proxy) bool {
 	return ok && r.RetireConns()
 }
 
+// keepsConns reports whether p carries all its streams over connections it
+// keeps.
+func keepsConns(p C.Proxy) bool {
+	k, ok := p.Adapter().(interface{ KeepsConns() bool })
+	return ok && k.KeepsConns()
+}
+
 // probe tests p and records the result. A live node whose probe has not
 // answered within the hedge delay, or failed, gets a second probe started
 // beside it: the node is alive if either answers, and the stalled probe is
@@ -633,7 +660,7 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 	// The second probe guards a live node against a false verdict; a dead
 	// node has none to lose, and every live node gets it, the slow ones too.
 	alive := p.AliveForTestUrl(url)
-	hedgeAt := hc.hedgeAt(recorder.LastProbeElapsed(url))
+	hedgeAt := hc.hedgeAt(recorder.LastProbeElapsed(url), keepsConns(p))
 	first := hc.startProbe(p, url, expectedStatus, nil)
 	defer first.cancel()
 	// The hedge delay counts from the probe's own start, not from its wait
