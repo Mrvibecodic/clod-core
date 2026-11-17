@@ -469,6 +469,9 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 			// Another check of the group was running: this one did not start.
 			gb.asked(verdictNone, failed)
 		case p.AliveForTestUrl(d.url):
+			if d.hold != nil {
+				d.hold()
+			}
 			gb.asked(verdictAlive, failed)
 		default:
 			gb.asked(verdictDead, failed)
