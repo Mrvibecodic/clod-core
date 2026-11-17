@@ -32,6 +32,10 @@ func (f *Fallback) Now() string {
 // DialContext implements C.ProxyAdapter
 func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	proxy := f.findAliveProxy(true)
+	// A node marked dead while the connection was being opened says nothing
+	// against the mark: only one known dead when the group took it does, and
+	// only by an answer through it.
+	dead := !proxy.AliveForTestUrl(f.testUrl)
 	born := time.Now()
 	c, err := proxy.DialContext(ctx, metadata)
 	if err == nil {
@@ -44,16 +48,17 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
 			if err == nil {
 				f.onDialSuccess()
-				f.onDeadNodeDialed(proxy, f.testUrl, f.healthCheck)
 			} else {
 				f.onDialFailed(proxy.Type(), err, f.healthCheck)
 			}
 		})
-	} else if err == nil {
-		f.onDeadNodeDialed(proxy, f.testUrl, f.healthCheck)
 	}
 	if err == nil {
-		c = f.watch(c, proxy, born, f.doubt(), nil)
+		var answered func()
+		if dead {
+			answered = func() { f.onDeadNodeDialed(proxy, f.testUrl, f.healthCheck) }
+		}
+		c = f.watch(c, proxy, born, f.doubt(), answered)
 	}
 
 	return c, err

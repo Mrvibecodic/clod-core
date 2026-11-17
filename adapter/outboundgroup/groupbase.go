@@ -350,7 +350,7 @@ const (
 	reviveRetryWait = time.Second
 )
 
-// onDeadNodeDialed is told of a connection through p that worked. A group
+// onDeadNodeDialed is told of a connection through p that got an answer. A group
 // dials a node marked dead only when none of its nodes is alive, and a check
 // that ran while the network was gone leaves them so until the next interval:
 // a connection that works shows the network is back, and the group is
@@ -377,7 +377,7 @@ func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
 	gb.reviveNext = now.Add(reviveMaxWait)
 	gb.reviveMux.Unlock()
 
-	log.Infoln("[Проба] %s: соединение через %s прошло, а узел помечен мёртвым — группа перепроверяется", gb.Name(), p.Name())
+	log.Infoln("[Проба] %s: через %s пришёл ответ, а узел помечен мёртвым — группа перепроверяется", gb.Name(), p.Name())
 	go func() {
 		probed := lastProbe(p, testUrl)
 		fn()
