@@ -113,7 +113,9 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (f *Fallback) doubt() doubt {
-	return doubt{url: f.testUrl, expected: f.expectedStatus, all: f.healthCheck}
+	return doubt{url: f.testUrl, expected: f.expectedStatus, all: f.healthCheck, next: func(but C.Proxy) []C.Proxy {
+		return aliveBut(f.GetProxies(false), but, f.testUrl)
+	}}
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {

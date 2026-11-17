@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -116,7 +117,15 @@ func (u *URLTest) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (u *URLTest) doubt() doubt {
-	return doubt{url: u.testUrl, expected: u.expectedStatus, all: u.healthCheck}
+	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck}
+}
+
+// nextNodes is the alive nodes of the group without the given one, the best
+// first: where the group would go from it.
+func (u *URLTest) nextNodes(but C.Proxy) []C.Proxy {
+	nodes := aliveBut(u.GetProxies(false), but, u.testUrl)
+	sort.SliceStable(nodes, func(i, j int) bool { return u.score(nodes[i]) < u.score(nodes[j]) })
+	return nodes
 }
 
 func (u *URLTest) healthCheck() {
