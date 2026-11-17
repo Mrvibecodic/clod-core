@@ -475,6 +475,7 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 			gb.asked(verdictAlive, failed)
 		default:
 			gb.asked(verdictDead, failed)
+			gb.leftDead(p, d)
 		}
 		return
 	}
@@ -527,6 +528,7 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		}
 		log.Warnln("[Проба] %s: %s, проба тоже — узел помечен мёртвым", p.Name(), reason)
 		gb.asked(verdictDead, failed)
+		gb.leftDead(p, d)
 		return
 	}
 	log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())

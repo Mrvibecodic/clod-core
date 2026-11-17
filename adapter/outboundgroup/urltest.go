@@ -149,7 +149,7 @@ func (u *URLTest) release() {
 }
 
 func (u *URLTest) doubt() doubt {
-	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck, hold: u.holdSpeed}
+	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck, hold: u.holdSpeed, again: u.release}
 }
 
 // nextNodes is the alive nodes of the group without the given one, the best
