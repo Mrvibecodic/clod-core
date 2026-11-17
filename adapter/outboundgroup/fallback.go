@@ -31,17 +31,19 @@ func (f *Fallback) Now() string {
 
 // DialContext implements C.ProxyAdapter
 func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	// Before the node is taken: a connection that took its node before the
+	// group went to another is the older of the two.
+	born := time.Now()
 	proxy := f.findAliveProxy(true)
 	// A node marked dead while the connection was being opened says nothing
 	// against the mark: only one known dead when the group took it does, and
 	// only by an answer through it.
 	dead := !proxy.AliveForTestUrl(f.testUrl)
-	born := time.Now()
 	c, err := proxy.DialContext(ctx, metadata)
 	if err == nil {
 		c.AppendToChains(f)
 	} else {
-		f.onDialFailed(proxy.Type(), err, f.checkAfter(proxy))
+		f.onDialFailed(proxy.Type(), err, f.checkAfter(proxy, born))
 	}
 
 	if N.NeedHandshake(c) {
@@ -49,7 +51,7 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 			if err == nil {
 				f.onDialSuccess()
 			} else {
-				f.onDialFailed(proxy.Type(), err, f.checkAfter(proxy))
+				f.onDialFailed(proxy.Type(), err, f.checkAfter(proxy, born))
 			}
 		})
 	}
@@ -124,8 +126,8 @@ func (f *Fallback) doubt() doubt {
 }
 
 // checkAfter is the check the failed connections through p ask for.
-func (f *Fallback) checkAfter(p C.Proxy) func() {
-	return func() { f.failedOf(p, f.doubt()) }
+func (f *Fallback) checkAfter(p C.Proxy, born time.Time) func() {
+	return func() { f.failedOf(p, born, f.doubt()) }
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {

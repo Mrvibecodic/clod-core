@@ -299,15 +299,14 @@ func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.asking = false
+	now := time.Now()
 	switch s.node {
 	case p:
 	case nil:
-		// Failed connections came before any that opened.
-		s.node = p
+		s.node, s.since = p, now
 	default:
 		return
 	}
-	now := time.Now()
 	grown := func() time.Time {
 		if s.pause == 0 {
 			s.pause = silencePause
@@ -496,14 +495,20 @@ func witnesses(p C.Proxy, next []C.Proxy) (first, more []C.Proxy) {
 // a dead node already has every node checked, as it always had: there is
 // nothing to lose, and the nodes that are back are found. So has a group
 // whose node is not a server of its own.
-func (gb *GroupBase) failedOf(p C.Proxy, d doubt) {
+//
+// born is when the group took p for the connection that failed. A failed
+// connection is one of the node the group is on as much as one that opened:
+// a node that only refuses is counted from its failures, and the wait its
+// check leaves is its own. The failures of a node the group has left ask
+// nothing.
+func (gb *GroupBase) failedOf(p C.Proxy, born time.Time, d doubt) {
 	if !carries(p) || !p.AliveForTestUrl(d.url) {
 		d.all()
 		return
 	}
 	s := &gb.silence
 	s.mu.Lock()
-	start := !s.asking && !time.Now().Before(s.failedQuietUntil)
+	start := s.follows(p, born) && !s.asking && !time.Now().Before(s.failedQuietUntil)
 	if start {
 		s.asking = true
 	}

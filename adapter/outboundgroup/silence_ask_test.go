@@ -269,7 +269,7 @@ func TestFailedConnectionsWithNobodyAnsweringMarkNothing(t *testing.T) {
 	a, b, c := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", false), askedNode("C", "192.0.2.3", false)
 	gb, provider, d := askedGroup(a, b, c)
 	gb.failedTimes = 3
-	gb.failedOf(a, d)
+	gb.failedOf(a, time.Now(), d)
 	if a.dead.Load() || b.dead.Load() || c.dead.Load() || a.records()+b.records()+c.records() != 0 {
 		t.Fatal("failed connections with the network down marked a node")
 	}
@@ -280,7 +280,7 @@ func TestFailedConnectionsWithNobodyAnsweringMarkNothing(t *testing.T) {
 		t.Fatal("the failures counted before the answer were kept")
 	}
 	asks := a.asks.Load()
-	gb.failedOf(a, d)
+	gb.failedOf(a, time.Now(), d)
 	if a.asks.Load() != asks {
 		t.Fatal("asked again within the pause")
 	}
@@ -290,7 +290,7 @@ func TestFailedConnectionsWithNobodyAnsweringMarkNothing(t *testing.T) {
 func TestFailedConnectionsBesideAnAnsweringNodeMarkTheNodeDead(t *testing.T) {
 	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
 	gb, provider, d := askedGroup(a, b)
-	gb.failedOf(a, d)
+	gb.failedOf(a, time.Now(), d)
 	if !a.dead.Load() || b.dead.Load() || provider.checks.Load() != 0 {
 		t.Fatalf("dead: the node %v, the other %v; checks of the group %d", a.dead.Load(), b.dead.Load(), provider.checks.Load())
 	}
@@ -308,7 +308,7 @@ func TestANodeThatAnswersWhileItsConnectionsFailIsAskedAgainSoon(t *testing.T) {
 		return time.Until(gb.silence.failedQuietUntil).Round(time.Second)
 	}
 	for _, want := range []time.Duration{silenceAfter, 2 * silenceAfter, 4 * silenceAfter, 8 * silenceAfter, silencePause, silencePause} {
-		gb.failedOf(a, d)
+		gb.failedOf(a, time.Now(), d)
 		if got := wait(); got != want {
 			t.Fatalf("asked again in %s, want %s", got, want)
 		}
@@ -320,7 +320,7 @@ func TestANodeThatAnswersWhileItsConnectionsFailIsAskedAgainSoon(t *testing.T) {
 		t.Fatal("the answer was written down")
 	}
 	gb.noteAnswer(a, time.Now())
-	gb.failedOf(a, d)
+	gb.failedOf(a, time.Now(), d)
 	if got := wait(); got != silenceAfter {
 		t.Fatalf("after an answered connection asked again in %s, want %s", got, silenceAfter)
 	}
@@ -331,7 +331,7 @@ func TestFailedConnectionsThroughADeadNodeCheckTheWholeGroup(t *testing.T) {
 	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
 	a.dead.Store(true)
 	gb, provider, d := askedGroup(a, b)
-	gb.failedOf(a, d)
+	gb.failedOf(a, time.Now(), d)
 	if provider.checks.Load() != 1 || a.asks.Load() != 0 {
 		t.Fatalf("checks of the group %d, the node asked %d times", provider.checks.Load(), a.asks.Load())
 	}
@@ -376,7 +376,7 @@ func TestThePauseOfASilentSiteDoesNotHoldFailedConnections(t *testing.T) {
 		t.Fatal("no pause after a node found alive")
 	}
 	a.answers.Store(false)
-	gb.failedOf(a, d)
+	gb.failedOf(a, time.Now(), d)
 	if !a.dead.Load() {
 		t.Fatal("failed connections were not answered within the pause of the silent site")
 	}
@@ -543,7 +543,7 @@ func TestFailedConnectionsThatStartedNoCheckMakeNoWaitLonger(t *testing.T) {
 	gb, _, d := askedGroup(a, b)
 	gb.failedTesting.Store(true)
 	for i := 0; i < 3; i++ {
-		gb.failedOf(a, d)
+		gb.failedOf(a, time.Now(), d)
 		gb.silence.mu.Lock()
 		wait, grown := time.Until(gb.silence.failedQuietUntil), gb.silence.failedPause
 		gb.silence.failedQuietUntil = time.Time{}
@@ -574,7 +574,7 @@ func TestAGroupInsideTheGroupIsNotAskedAbout(t *testing.T) {
 	if got := gb.watch(conn, inner, time.Now(), d, nil); got != C.Conn(conn) {
 		t.Fatal("a connection through a group inside the group is watched once more")
 	}
-	gb.failedOf(inner, d)
+	gb.failedOf(inner, time.Now(), d)
 	if provider.checks.Load() != 1 || inner.asks.Load() != 0 || b.asks.Load() != 0 {
 		t.Fatalf("checks of the group %d, the inner group asked %d times, the node beside %d", provider.checks.Load(), inner.asks.Load(), b.asks.Load())
 	}
@@ -615,5 +615,41 @@ func TestANetworkBackWhileTheMoreAreAskedMarksNothingDead(t *testing.T) {
 	}
 	if nodes[0].records() != 0 {
 		t.Fatal("the second try the node needed while the network came back was written to it")
+	}
+}
+
+// The failed connections of a node the group went to without one that
+// opened are counted to that node: the wait its check leaves holds the next
+// ones, and they do not have it probed again and again.
+func TestFailedConnectionsOfANodeTheGroupWentToLeaveTheirWait(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
+	gb, _, d := askedGroup(a, b)
+	gb.noteAnswer(a, time.Now())
+	time.Sleep(time.Millisecond)
+	gb.failedOf(b, time.Now(), d)
+	asks := b.asks.Load()
+	if asks == 0 {
+		t.Fatal("the node was not asked about")
+	}
+	gb.failedOf(b, time.Now(), d)
+	if b.asks.Load() != asks {
+		t.Fatal("asked again at once: the wait was not left to the node the group is on")
+	}
+}
+
+// A connection through a node the group has left that fails late asks
+// nothing, and what is known of the node the group is on stays.
+func TestALateFailureOfANodeTheGroupLeftAsksNothing(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
+	gb, _, d := askedGroup(a, b)
+	early := time.Now()
+	time.Sleep(time.Millisecond)
+	gb.noteAnswer(b, time.Now())
+	gb.failedOf(a, early, d)
+	if a.asks.Load() != 0 || b.asks.Load() != 0 {
+		t.Fatal("a node the group has left was asked about")
+	}
+	if gb.silence.node != C.Proxy(b) {
+		t.Fatal("the group no longer counts the node it is on")
 	}
 }
