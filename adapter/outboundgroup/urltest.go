@@ -83,7 +83,7 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 	if err == nil {
 		c.AppendToChains(u)
 	} else {
-		u.onDialFailed(proxy.Type(), err, u.healthCheck)
+		u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy))
 	}
 
 	if N.NeedHandshake(c) {
@@ -91,7 +91,7 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 			if err == nil {
 				u.onDialSuccess()
 			} else {
-				u.onDialFailed(proxy.Type(), err, u.healthCheck)
+				u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy))
 			}
 		})
 	}
@@ -113,7 +113,7 @@ func (u *URLTest) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	if err == nil {
 		pc.AppendToChains(u)
 	} else {
-		u.onDialFailed(proxy.Type(), err, u.healthCheck)
+		u.onDialFailed(proxy.Type(), err, u.checkAfter(proxy))
 	}
 
 	return pc, err
@@ -155,6 +155,11 @@ func (u *URLTest) release() {
 
 func (u *URLTest) doubt() doubt {
 	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck, hold: u.holdSpeed, again: u.release}
+}
+
+// checkAfter is the check the failed connections through p ask for.
+func (u *URLTest) checkAfter(p C.Proxy) func() {
+	return func() { u.failedOf(p, u.doubt()) }
 }
 
 // nextNodes is the alive nodes of the group without the given one, the best
