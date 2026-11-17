@@ -74,8 +74,12 @@ func (s *silence) follows(p C.Proxy, born time.Time) bool {
 	return true
 }
 
-// silenceWitnesses is how many other nodes are asked beside the one in doubt.
-const silenceWitnesses = 3
+// silenceWitnesses is how many other nodes are asked beside the one in doubt;
+// silenceMoreWitnesses is how many more are, when none of those answered.
+const (
+	silenceWitnesses     = 3
+	silenceMoreWitnesses = 6
+)
 
 // doubt is how a group asks about a node its connections give it doubts of.
 type doubt struct {
@@ -435,12 +439,19 @@ func (gb *GroupBase) askHeld(nodes []C.Proxy, d doubt) []answer {
 	return answers
 }
 
-// witnesses picks the nodes asked beside p: the first the group would go to.
-// One of them answering says the network is up, and it is where the group
-// goes. Nodes on the server of p say little of the network, they go down with
-// it: when the first are all there, the last gives its place to the best node
-// of another server.
-func witnesses(p C.Proxy, next []C.Proxy) []C.Proxy {
+// witnesses picks the nodes asked beside p, out of those the group would go
+// to, best first. One of them answering says the network is up, and it is
+// where the group goes.
+//
+// The first are few: the best node, and, so that they do not all go down
+// with p, the best node of another kind and the best node of another server,
+// if there are such. Nodes of one kind or of one server stop together.
+//
+// more is asked only when none of the first answered: a few nodes, each of a
+// kind or of a server not asked yet. Before the group takes it for the
+// network of the device, it hears from every kind and server it has, up to
+// silenceMoreWitnesses of them.
+func witnesses(p C.Proxy, next []C.Proxy) (first, more []C.Proxy) {
 	servers := make([]C.Proxy, 0, len(next))
 	for _, node := range next {
 		// A node that refuses everything has no answer to give, and a group
@@ -449,22 +460,41 @@ func witnesses(p C.Proxy, next []C.Proxy) []C.Proxy {
 			servers = append(servers, node)
 		}
 	}
-	if len(servers) <= silenceWitnesses {
-		return servers
+	kinds, hosts := map[C.AdapterType]bool{p.Type(): true}, map[string]bool{C.ProbeHostOf(p): true}
+	taken := make(map[C.Proxy]bool, silenceWitnesses+silenceMoreWitnesses)
+	take := func(list *[]C.Proxy, node C.Proxy) {
+		*list = append(*list, node)
+		taken[node], kinds[node.Type()], hosts[C.ProbeHostOf(node)] = true, true, true
 	}
-	host := C.ProbeHostOf(p)
-	picked := servers[:silenceWitnesses:silenceWitnesses]
-	for _, node := range picked {
-		if C.ProbeHostOf(node) != host {
-			return picked
+	if len(servers) > 0 {
+		take(&first, servers[0])
+	}
+	for _, node := range servers {
+		if len(first) < silenceWitnesses && !taken[node] && !kinds[node.Type()] {
+			take(&first, node)
+			break
 		}
 	}
-	for _, node := range servers[silenceWitnesses:] {
-		if C.ProbeHostOf(node) != host {
-			return append(picked[:silenceWitnesses-1:silenceWitnesses-1], node)
+	for _, node := range servers {
+		if len(first) < silenceWitnesses && !taken[node] && !hosts[C.ProbeHostOf(node)] {
+			take(&first, node)
+			break
 		}
 	}
-	return picked
+	for _, node := range servers {
+		if len(first) < silenceWitnesses && !taken[node] {
+			take(&first, node)
+		}
+	}
+	for _, node := range servers {
+		if len(more) == silenceMoreWitnesses {
+			break
+		}
+		if !taken[node] && (!kinds[node.Type()] || !hosts[C.ProbeHostOf(node)]) {
+			take(&more, node)
+		}
+	}
+	return first, more
 }
 
 // failedOf answers the connections through p that failed. A group that is on
@@ -496,9 +526,14 @@ func (gb *GroupBase) failedOf(p C.Proxy, d doubt) {
 //     another node did not is written to p;
 //   - p is silent and another node answers: p is dead, the answers are
 //     written and the group leaves;
-//   - nobody answers: it is the network of the device, and nothing is written.
-//     Written down, the failures would mark every node dead for an outage the
-//     nodes had no part in, and the marks outlive it.
+//   - nobody answers, of the few asked first and of the more asked then: it
+//     is the network of the device, and nothing is written. Written down, the
+//     failures would mark every node dead for an outage the nodes had no part
+//     in, and the marks outlive it.
+//
+// The more are asked together with p and the first few, anew: what those said
+// is seconds old by then, and a network that came back meanwhile would have
+// their silence held against them beside the answers of the more.
 //
 // A group with no other node alive has every node checked instead: there is
 // nobody to tell p from the network by.
@@ -508,8 +543,8 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		gb.asked(p, verdictNone, failed)
 		return
 	}
-	others := witnesses(p, d.next(p))
-	if len(others) == 0 {
+	first, more := witnesses(p, d.next(p))
+	if len(first) == 0 {
 		seen := lastProbe(p, d.url)
 		gb.failedTesting.Store(false)
 		d.all()
@@ -528,24 +563,35 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		}
 		return
 	}
-	answers := gb.askHeld(append([]C.Proxy{p}, others...), d)
 	// As after a check of the whole group: the failures of these seconds
 	// are answered.
-	gb.failedTestMux.Lock()
-	gb.failedTimes = 0
-	gb.failedTestMux.Unlock()
-	gb.failedTesting.Store(false)
-	self := answers[0]
+	end := func(v verdict) {
+		gb.failedTestMux.Lock()
+		gb.failedTimes = 0
+		gb.failedTestMux.Unlock()
+		gb.failedTesting.Store(false)
+		gb.asked(p, v, failed)
+	}
+	nodes := append([]C.Proxy{p}, first...)
+	answers := gb.askHeld(nodes, d)
+	self, others := answers[0], answers[1:]
+	again := len(more) > 0 && self.known && !self.answered && !self.stale(d.url) && !anyAnswered(others)
+	if again {
+		answers = gb.askHeld(append(nodes, more...), d)
+		self, others = answers[0], answers[1:]
+	}
 	switch {
 	case !self.known || self.stale(d.url):
-		gb.asked(p, verdictNone, failed)
+		end(verdictNone)
 		return
 	case self.answered:
 		// A node that answered at its second try beside one that answered
 		// at the first is unsteady, and that is written down: url-test ranks
-		// it below the steady ones. With no node steady it is the network.
-		if !self.held.steady() {
-			for _, other := range answers[1:] {
+		// it below the steady ones. With no node steady it is the network,
+		// and so it is after nobody answered: a network coming back gives
+		// one node its answer a try sooner than another.
+		if !again && !self.held.steady() {
+			for _, other := range others {
 				if other.answered && other.held.steady() {
 					self.replay(d.url)
 					log.Infoln("[Проба] %s: ответил со второй попытки, узлы рядом — с первой", p.Name())
@@ -553,35 +599,41 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 				}
 			}
 		}
-		gb.asked(p, verdictAlive, failed)
+		end(verdictAlive)
 		return
 	}
-	for _, other := range answers[1:] {
-		if !other.answered {
-			continue
-		}
-		// A probe written to p by someone else meanwhile stands over this
-		// answer: nothing was found out.
-		if !self.replay(d.url) {
-			gb.asked(p, verdictNone, failed)
-			return
-		}
-		for _, each := range answers[1:] {
-			if each.known {
-				each.replay(d.url)
-			}
-		}
-		reason := "запросы через узел остаются без ответа"
-		if failed {
-			reason = "соединения через узел не открываются"
-		}
-		log.Warnln("[Проба] %s: %s, проба тоже — узел помечен мёртвым", p.Name(), reason)
-		gb.asked(p, verdictDead, failed)
-		gb.leftDead(p, d)
+	if !anyAnswered(others) {
+		log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())
+		end(verdictNoNetwork)
 		return
 	}
-	log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())
-	gb.asked(p, verdictNoNetwork, failed)
+	// A probe written to p by someone else meanwhile stands over this
+	// answer: nothing was found out.
+	if !self.replay(d.url) {
+		end(verdictNone)
+		return
+	}
+	for _, each := range others {
+		if each.known {
+			each.replay(d.url)
+		}
+	}
+	reason := "запросы через узел остаются без ответа"
+	if failed {
+		reason = "соединения через узел не открываются"
+	}
+	log.Warnln("[Проба] %s: %s, проба тоже — узел помечен мёртвым", p.Name(), reason)
+	end(verdictDead)
+	gb.leftDead(p, d)
+}
+
+func anyAnswered(answers []answer) bool {
+	for _, each := range answers {
+		if each.answered {
+			return true
+		}
+	}
+	return false
 }
 
 // aliveBut is the alive nodes of the list without the given one.

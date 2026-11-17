@@ -3,6 +3,7 @@ package outboundgroup
 import (
 	"context"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,6 +25,8 @@ type askedProxy struct {
 	second atomic.Bool
 	// during runs while the node is probed.
 	during func()
+	// trojan: the node is of another kind than the rest.
+	trojan bool
 	dead   atomic.Bool
 	asks   atomic.Int32
 
@@ -36,7 +39,12 @@ func (p *askedProxy) Addr() string                { return p.addr }
 func (p *askedProxy) Adapter() C.ProxyAdapter     { return outbound.NewDirect() }
 func (p *askedProxy) AliveForTestUrl(string) bool { return !p.dead.Load() }
 func (p *askedProxy) ProxyInfo() C.ProxyInfo      { return C.ProxyInfo{} }
-func (p *askedProxy) Type() C.AdapterType         { return C.Vless }
+func (p *askedProxy) Type() C.AdapterType {
+	if p.trojan {
+		return C.Trojan
+	}
+	return C.Vless
+}
 
 func (p *askedProxy) URLTest(ctx context.Context, _ string, _ utils.IntRanges[uint16]) (uint16, error) {
 	asks := p.asks.Add(1)
@@ -436,8 +444,8 @@ func TestANodeThatRefusesEverythingIsNoWitness(t *testing.T) {
 	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
 	reject := &typedProxy{askedProxy: askedNode("REJECT", "", false), kind: C.Reject}
 	inner := &typedProxy{askedProxy: askedNode("inner", "", true), kind: C.URLTest}
-	if got := witnesses(a, []C.Proxy{reject, inner, b}); len(got) != 1 || got[0] != C.Proxy(b) {
-		t.Fatalf("witnesses: %d", len(got))
+	if got, more := witnesses(a, []C.Proxy{reject, inner, b}); len(got) != 1 || got[0] != C.Proxy(b) || len(more) != 0 {
+		t.Fatalf("witnesses: %d and %d", len(got), len(more))
 	}
 }
 
@@ -447,6 +455,86 @@ type typedProxy struct {
 }
 
 func (p *typedProxy) Type() C.AdapterType { return p.kind }
+
+func asked(nodes []*askedProxy) string {
+	names := ""
+	for _, n := range nodes {
+		if n.asks.Load() > 0 {
+			names += n.name
+		}
+	}
+	return names
+}
+
+// Nodes of one kind stop together: when the first the group would go to are
+// all of the kind of the node in doubt, one of them gives its place to the
+// best node of another kind.
+func TestOneWitnessIsOfAnotherKind(t *testing.T) {
+	nodes := []*askedProxy{askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", false), askedNode("C", "192.0.2.3", false), askedNode("D", "192.0.2.4", false), askedNode("E", "192.0.2.5", false), askedNode("F", "192.0.2.6", true)}
+	nodes[5].trojan = true
+	gb, provider, d := askedGroup(nodes...)
+	gb.askOf(nodes[0], d, false)
+	if got := asked(nodes[1:]); got != "BCF" {
+		t.Fatalf("asked beside the node: %q, want BCF", got)
+	}
+	if !nodes[0].dead.Load() || nodes[5].dead.Load() || provider.checks.Load() != 0 {
+		t.Fatal("the kind that stopped was not told from the one that works")
+	}
+}
+
+// With none of the first few answering the group does not take it for the
+// network yet: it asks a few more, each of a kind or of a server not asked
+// before, and one of them answering shows the node dead.
+func TestSilentWitnessesHaveMoreNodesAsked(t *testing.T) {
+	// Three servers of three nodes each, and a node of another kind on the
+	// first of them: the node in doubt and the first asked are silent.
+	nodes := []*askedProxy{
+		askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.1", false), askedNode("C", "192.0.2.1", false),
+		askedNode("D", "192.0.2.2", false), askedNode("E", "192.0.2.2", true), askedNode("F", "192.0.2.2", true),
+		askedNode("G", "192.0.2.3", true), askedNode("H", "192.0.2.3", true), askedNode("I", "192.0.2.3", true),
+		askedNode("J", "192.0.2.1", false),
+	}
+	nodes[9].trojan = true
+	gb, provider, d := askedGroup(nodes...)
+	gb.askOf(nodes[0], d, false)
+	// First: the best (B), one of another kind (J), one of another server
+	// (D). Then: the third server (G) has not been asked.
+	if got := asked(nodes[1:]); got != "BDGJ" {
+		t.Fatalf("asked beside the node: %q, want BDGJ", got)
+	}
+	if !nodes[0].dead.Load() || !nodes[1].dead.Load() || !nodes[3].dead.Load() || !nodes[9].dead.Load() || nodes[6].dead.Load() {
+		t.Fatal("the silent nodes were not told from the one that answers")
+	}
+	if nodes[6].records() != 1 || provider.checks.Load() != 0 {
+		t.Fatalf("the answer was written %d times, the whole group checked %d times", nodes[6].records(), provider.checks.Load())
+	}
+	if gb.rechecks.Load() != 1 {
+		t.Fatal("the node the group left is not probed again")
+	}
+}
+
+// With nobody answering among the first and the more it is the network:
+// nothing is written, and no more than silenceMoreWitnesses were asked on top
+// of the first.
+func TestNobodyAnsweringAmongTheMoreLeavesNothingWritten(t *testing.T) {
+	var nodes []*askedProxy
+	for i := 0; i < 14; i++ {
+		nodes = append(nodes, askedNode(string(rune('A'+i)), "192.0.2."+strconv.Itoa(i+1), false))
+	}
+	gb, provider, d := askedGroup(nodes...)
+	gb.askOf(nodes[0], d, false)
+	if got := len(asked(nodes[1:])); got != silenceWitnesses+silenceMoreWitnesses {
+		t.Fatalf("asked %d nodes beside the node, want %d", got, silenceWitnesses+silenceMoreWitnesses)
+	}
+	for _, n := range nodes {
+		if n.dead.Load() || n.records() != 0 {
+			t.Fatalf("%s: dead %v, records %d with nobody answering", n.name, n.dead.Load(), n.records())
+		}
+	}
+	if provider.checks.Load() != 0 || !quiet(gb) {
+		t.Fatal("the whole group was checked, or no pause was left")
+	}
+}
 
 // Failed connections that find another check running start none: the wait
 // before they ask again does not grow for it.
@@ -489,5 +577,43 @@ func TestAGroupInsideTheGroupIsNotAskedAbout(t *testing.T) {
 	gb.failedOf(inner, d)
 	if provider.checks.Load() != 1 || inner.asks.Load() != 0 || b.asks.Load() != 0 {
 		t.Fatalf("checks of the group %d, the inner group asked %d times, the node beside %d", provider.checks.Load(), inner.asks.Load(), b.asks.Load())
+	}
+}
+
+// A network that comes back while the more are asked has everybody asked
+// anew: the silence of the node and of the first few is seconds old by then,
+// and it is not held against them beside the answers of the more.
+func TestANetworkBackWhileTheMoreAreAskedMarksNothingDead(t *testing.T) {
+	var nodes []*askedProxy
+	for i := 0; i < 8; i++ {
+		nodes = append(nodes, askedNode(string(rune('A'+i)), "192.0.2."+strconv.Itoa(i+1), false))
+	}
+	// The more are asked only after the first few kept silent: the network
+	// is back by the time one of them is, a moment after the node was asked
+	// again, so that the node needs its second try and the other does not.
+	nodes[4].during = func() {
+		for nodes[0].asks.Load() < 3 {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond)
+		for _, n := range nodes {
+			n.answers.Store(true)
+		}
+	}
+	gb, provider, d := askedGroup(nodes...)
+	gb.askOf(nodes[0], d, false)
+	if nodes[4].asks.Load() == 0 {
+		t.Fatal("the more were not asked")
+	}
+	for _, n := range nodes {
+		if n.dead.Load() {
+			t.Fatalf("%s is marked dead for the silence of a network that is back", n.name)
+		}
+	}
+	if gb.rechecks.Load() != 0 || provider.checks.Load() != 0 {
+		t.Fatal("the group left its node, or was checked whole")
+	}
+	if nodes[0].records() != 0 {
+		t.Fatal("the second try the node needed while the network came back was written to it")
 	}
 }
