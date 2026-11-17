@@ -19,6 +19,10 @@ func (v *Vmess) RetireConns() bool {
 	return v.gunClient != nil && v.gunClient.Retire()
 }
 
+func (t *Tuic) RetireConns() bool {
+	return t.client != nil && t.client.Retire()
+}
+
 func (p *autoCloseProxyAdapter) RetireConns() bool {
 	r, ok := p.ProxyAdapter.(interface{ RetireConns() bool })
 	return ok && r.RetireConns()
