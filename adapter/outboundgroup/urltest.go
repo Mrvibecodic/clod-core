@@ -85,6 +85,10 @@ func (u *URLTest) ForceSet(name string) {
 // DialContext implements C.ProxyAdapter
 func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	proxy := u.fast(true)
+	// A node marked dead while the connection was being opened says nothing
+	// against the mark: only one known dead when the group took it does, and
+	// only by an answer through it.
+	dead := !proxy.AliveForTestUrl(u.testUrl)
 	born := time.Now()
 	c, err = proxy.DialContext(ctx, metadata)
 	if err == nil {
@@ -97,16 +101,17 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
 			if err == nil {
 				u.onDialSuccess()
-				u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck)
 			} else {
 				u.onDialFailed(proxy.Type(), err, u.healthCheck)
 			}
 		})
-	} else if err == nil {
-		u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck)
 	}
 	if err == nil {
-		c = u.watch(c, proxy, born, u.doubt(), nil)
+		var answered func()
+		if dead {
+			answered = func() { u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck) }
+		}
+		c = u.watch(c, proxy, born, u.doubt(), answered)
 	}
 
 	return c, err
