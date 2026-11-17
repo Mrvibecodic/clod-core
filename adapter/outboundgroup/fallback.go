@@ -32,6 +32,7 @@ func (f *Fallback) Now() string {
 // DialContext implements C.ProxyAdapter
 func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	proxy := f.findAliveProxy(true)
+	born := time.Now()
 	c, err := proxy.DialContext(ctx, metadata)
 	if err == nil {
 		c.AppendToChains(f)
@@ -50,6 +51,9 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 		})
 	} else if err == nil {
 		f.onDeadNodeDialed(proxy, f.testUrl, f.healthCheck)
+	}
+	if err == nil {
+		c = f.watch(c, proxy, born, f.doubt(), nil)
 	}
 
 	return c, err
@@ -106,6 +110,10 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	proxy := f.findAliveProxy(touch)
 	return proxy
+}
+
+func (f *Fallback) doubt() doubt {
+	return doubt{url: f.testUrl, expected: f.expectedStatus, all: f.healthCheck}
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {

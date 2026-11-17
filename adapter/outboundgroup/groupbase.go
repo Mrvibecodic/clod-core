@@ -36,6 +36,7 @@ type GroupBase struct {
 	failedTesting     atomic.Bool
 	testTimeout       int
 	maxFailedTimes    int
+	silence           silence
 	emptyFallback     C.Proxy
 	// reviveNext is when a dial through a node marked dead may start the next
 	// check, reviveWait the pause after it; see onDeadNodeDialed.

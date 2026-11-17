@@ -81,6 +81,7 @@ func (u *URLTest) ForceSet(name string) {
 // DialContext implements C.ProxyAdapter
 func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	proxy := u.fast(true)
+	born := time.Now()
 	c, err = proxy.DialContext(ctx, metadata)
 	if err == nil {
 		c.AppendToChains(u)
@@ -99,6 +100,9 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 		})
 	} else if err == nil {
 		u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck)
+	}
+	if err == nil {
+		c = u.watch(c, proxy, born, u.doubt(), nil)
 	}
 
 	return c, err
@@ -120,6 +124,10 @@ func (u *URLTest) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 // Unwrap implements C.ProxyAdapter
 func (u *URLTest) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	return u.fast(touch)
+}
+
+func (u *URLTest) doubt() doubt {
+	return doubt{url: u.testUrl, expected: u.expectedStatus, all: u.healthCheck}
 }
 
 func (u *URLTest) healthCheck() {
