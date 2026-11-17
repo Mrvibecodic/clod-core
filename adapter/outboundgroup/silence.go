@@ -1,13 +1,18 @@
 package outboundgroup
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/buf"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
 
 const (
@@ -68,6 +73,9 @@ func (s *silence) follows(p C.Proxy, born time.Time) bool {
 	s.pause, s.failedPause, s.quietUntil, s.failedQuietUntil, s.noNetwork = 0, 0, time.Time{}, time.Time{}, false
 	return true
 }
+
+// silenceWitnesses is how many other nodes are asked beside the one in doubt.
+const silenceWitnesses = 3
 
 // doubt is how a group asks about a node its connections give it doubts of.
 type doubt struct {
@@ -309,24 +317,226 @@ func (gb *GroupBase) asked(v verdict, failed bool) {
 	}
 }
 
-// askOf answers the connections p left unanswered: it has every node of the
-// group checked.
+// heldProxy has a node probed without the result being written to it: the
+// caller decides what the probe means.
+type heldProxy struct {
+	C.Proxy
+
+	mu      sync.Mutex
+	results []*C.ProbeResult
+	soft    []time.Time
+}
+
+func (h *heldProxy) RecordProbe(_ string, result *C.ProbeResult) {
+	h.mu.Lock()
+	h.results = append(h.results, result)
+	h.mu.Unlock()
+}
+
+func (h *heldProxy) RecordSoftFailure(_ string, at time.Time) {
+	h.mu.Lock()
+	h.soft = append(h.soft, at)
+	h.mu.Unlock()
+}
+
+func (h *heldProxy) LastProbeElapsed(url string) time.Duration {
+	if r, ok := h.Proxy.(C.ProbeRecorder); ok {
+		return r.LastProbeElapsed(url)
+	}
+	return 0
+}
+
+// steady reports whether the node answered at its first try.
+func (h *heldProxy) steady() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.soft) == 0
+}
+
+type answer struct {
+	held *heldProxy
+	// seen is the last probe written to the node before this one.
+	seen time.Time
+	// known is false for a probe that found nothing out: it was cut short or
+	// the network was switching.
+	answered, known bool
+}
+
+// stale reports whether the node has been probed by someone else since: what
+// they wrote is newer than this answer, and theirs stands.
+func (a answer) stale(url string) bool {
+	return !lastProbe(a.held.Proxy, url).Equal(a.seen)
+}
+
+// replay writes what the probe found to the node and reports whether it did:
+// not over a newer probe.
+func (a answer) replay(url string) bool {
+	r, ok := a.held.Proxy.(C.ProbeRecorder)
+	if !ok || a.stale(url) {
+		return false
+	}
+	a.held.mu.Lock()
+	defer a.held.mu.Unlock()
+	for _, at := range a.held.soft {
+		r.RecordSoftFailure(url, at)
+	}
+	for _, result := range a.held.results {
+		r.RecordProbe(url, result)
+	}
+	return true
+}
+
+func (gb *GroupBase) askHeld(nodes []C.Proxy, d doubt) []answer {
+	timeout := time.Duration(gb.testTimeout) * time.Millisecond
+	expected, _ := utils.NewUnsignedRanges[uint16](d.expected)
+	answers := make([]answer, len(nodes))
+	var wg sync.WaitGroup
+	for i, node := range nodes {
+		wg.Add(1)
+		go func(i int, node C.Proxy) {
+			defer wg.Done()
+			held := &heldProxy{Proxy: node}
+			seen := lastProbe(node, d.url)
+			ctx, cancel := context.WithTimeout(context.Background(), provider.ProbeHedgeDelay+timeout+C.ProbeReserve)
+			defer cancel()
+			_, err := provider.ProbeNode(ctx, held, d.url, expected, timeout)
+			known := err == nil || (ctx.Err() == nil && !errors.Is(err, provider.ErrProbeDiscarded))
+			answers[i] = answer{held: held, seen: seen, answered: err == nil, known: known}
+		}(i, node)
+	}
+	wg.Wait()
+	return answers
+}
+
+// witnesses picks the nodes asked beside p: the first the group would go to.
+// One of them answering says the network is up, and it is where the group
+// goes. Nodes on the server of p say little of the network, they go down with
+// it: when the first are all there, the last gives its place to the best node
+// of another server.
+func witnesses(p C.Proxy, next []C.Proxy) []C.Proxy {
+	servers := make([]C.Proxy, 0, len(next))
+	for _, node := range next {
+		// A node that refuses everything has no answer to give.
+		if t := node.Type(); t != C.Reject && t != C.RejectDrop && t != C.Pass && t != C.Compatible {
+			servers = append(servers, node)
+		}
+	}
+	if len(servers) <= silenceWitnesses {
+		return servers
+	}
+	host := C.ProbeHostOf(p)
+	picked := servers[:silenceWitnesses:silenceWitnesses]
+	for _, node := range picked {
+		if C.ProbeHostOf(node) != host {
+			return picked
+		}
+	}
+	for _, node := range servers[silenceWitnesses:] {
+		if C.ProbeHostOf(node) != host {
+			return append(picked[:silenceWitnesses-1:silenceWitnesses-1], node)
+		}
+	}
+	return picked
+}
+
+// askOf answers the connections p failed or left unanswered. It probes p and
+// a few nodes the group would go to, at once, and writes nothing down until
+// it has their answers:
+//   - p answers: it was the site, nothing is written, so the delay measured at
+//     a bad moment moves the group nowhere. Only a second try p needed where
+//     another node did not is written to p;
+//   - p is silent and another node answers: p is dead, the answers are
+//     written and the group leaves;
+//   - nobody answers: it is the network of the device, and nothing is written.
+//     Written down, the failures would mark every node dead for an outage the
+//     nodes had no part in, and the marks outlive it.
+//
+// A group with no other node alive has every node checked instead: there is
+// nobody to tell p from the network by.
 func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 	// The connections opened before p was marked dead go silent after it.
 	if !p.AliveForTestUrl(d.url) || !gb.failedTesting.CompareAndSwap(false, true) {
 		gb.asked(verdictNone, failed)
 		return
 	}
-	seen := lastProbe(p, d.url)
-	gb.failedTesting.Store(false)
-	d.all()
-	switch {
-	case lastProbe(p, d.url).Equal(seen):
-		// Another check of the group was running: this one did not start.
-		gb.asked(verdictNone, failed)
-	case p.AliveForTestUrl(d.url):
-		gb.asked(verdictAlive, failed)
-	default:
-		gb.asked(verdictDead, failed)
+	others := witnesses(p, d.next(p))
+	if len(others) == 0 {
+		seen := lastProbe(p, d.url)
+		gb.failedTesting.Store(false)
+		d.all()
+		switch {
+		case lastProbe(p, d.url).Equal(seen):
+			// Another check of the group was running: this one did not start.
+			gb.asked(verdictNone, failed)
+		case p.AliveForTestUrl(d.url):
+			gb.asked(verdictAlive, failed)
+		default:
+			gb.asked(verdictDead, failed)
+		}
+		return
 	}
+	answers := gb.askHeld(append([]C.Proxy{p}, others...), d)
+	// As after a check of the whole group: the failures of these seconds
+	// are answered.
+	gb.failedTestMux.Lock()
+	gb.failedTimes = 0
+	gb.failedTestMux.Unlock()
+	gb.failedTesting.Store(false)
+	self := answers[0]
+	switch {
+	case !self.known || self.stale(d.url):
+		gb.asked(verdictNone, failed)
+		return
+	case self.answered:
+		// A node that answered at its second try beside one that answered
+		// at the first is unsteady, and that is written down: url-test ranks
+		// it below the steady ones. With no node steady it is the network.
+		if !self.held.steady() {
+			for _, other := range answers[1:] {
+				if other.answered && other.held.steady() {
+					self.replay(d.url)
+					log.Infoln("[Проба] %s: ответил со второй попытки, узлы рядом — с первой", p.Name())
+					break
+				}
+			}
+		}
+		gb.asked(verdictAlive, failed)
+		return
+	}
+	for _, other := range answers[1:] {
+		if !other.answered {
+			continue
+		}
+		// A probe written to p by someone else meanwhile stands over this
+		// answer: nothing was found out.
+		if !self.replay(d.url) {
+			gb.asked(verdictNone, failed)
+			return
+		}
+		for _, each := range answers[1:] {
+			if each.known {
+				each.replay(d.url)
+			}
+		}
+		reason := "запросы через узел остаются без ответа"
+		if failed {
+			reason = "соединения через узел не открываются"
+		}
+		log.Warnln("[Проба] %s: %s, проба тоже — узел помечен мёртвым", p.Name(), reason)
+		gb.asked(verdictDead, failed)
+		return
+	}
+	log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())
+	gb.asked(verdictNoNetwork, failed)
+}
+
+// aliveBut is the alive nodes of the list without the given one.
+func aliveBut(proxies []C.Proxy, but C.Proxy, url string) []C.Proxy {
+	var alive []C.Proxy
+	for _, proxy := range proxies {
+		if proxy != but && proxy.AliveForTestUrl(url) {
+			alive = append(alive, proxy)
+		}
+	}
+	return alive
 }
