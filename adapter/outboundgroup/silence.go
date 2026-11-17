@@ -212,14 +212,23 @@ func (gb *GroupBase) watch(c C.Conn, p C.Proxy, born time.Time, d doubt, answere
 	return &watchedConn{Conn: c, gb: gb, node: p, born: born, answered: answered, ask: func() { gb.askOf(p, d, false) }}
 }
 
-// carries reports whether p is a server of its own: the built-in ways out
-// are not asked about.
+// carries reports whether p is a server of its own. The built-in ways out
+// are not asked about, and neither is a group inside the group: it answers
+// for whatever node it is on, and it has checks of its own.
 func carries(p C.Proxy) bool {
 	switch p.Type() {
 	case C.Direct, C.Compatible, C.Reject, C.Pass, C.RejectDrop:
 		return false
 	}
-	return true
+	return !isGroup(p)
+}
+
+func isGroup(p C.Proxy) bool {
+	switch p.Type() {
+	case C.Selector, C.Fallback, C.URLTest, C.LoadBalance, C.Relay:
+		return true
+	}
+	return false
 }
 
 func (gb *GroupBase) noteAnswer(p C.Proxy, born time.Time) {
@@ -434,8 +443,9 @@ func (gb *GroupBase) askHeld(nodes []C.Proxy, d doubt) []answer {
 func witnesses(p C.Proxy, next []C.Proxy) []C.Proxy {
 	servers := make([]C.Proxy, 0, len(next))
 	for _, node := range next {
-		// A node that refuses everything has no answer to give.
-		if t := node.Type(); t != C.Reject && t != C.RejectDrop && t != C.Pass && t != C.Compatible {
+		// A node that refuses everything has no answer to give, and a group
+		// answers for whatever node it is on.
+		if t := node.Type(); t != C.Reject && t != C.RejectDrop && t != C.Pass && t != C.Compatible && !isGroup(node) {
 			servers = append(servers, node)
 		}
 	}
@@ -459,9 +469,10 @@ func witnesses(p C.Proxy, next []C.Proxy) []C.Proxy {
 
 // failedOf answers the connections through p that failed. A group that is on
 // a dead node already has every node checked, as it always had: there is
-// nothing to lose, and the nodes that are back are found.
+// nothing to lose, and the nodes that are back are found. So has a group
+// whose node is not a server of its own.
 func (gb *GroupBase) failedOf(p C.Proxy, d doubt) {
-	if !p.AliveForTestUrl(d.url) {
+	if !carries(p) || !p.AliveForTestUrl(d.url) {
 		d.all()
 		return
 	}

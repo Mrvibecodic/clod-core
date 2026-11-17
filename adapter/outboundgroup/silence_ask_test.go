@@ -2,6 +2,7 @@ package outboundgroup
 
 import (
 	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -428,12 +429,14 @@ func TestACheckOfTheGroupThatDidNotStartLeavesNoPause(t *testing.T) {
 	}
 }
 
-// A node that refuses everything has no answer to give: it is not asked
-// beside the node in doubt.
+// A node that refuses everything has no answer to give, and a group inside
+// the group answers for whatever node it is on: neither is asked beside the
+// node in doubt.
 func TestANodeThatRefusesEverythingIsNoWitness(t *testing.T) {
 	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
 	reject := &typedProxy{askedProxy: askedNode("REJECT", "", false), kind: C.Reject}
-	if got := witnesses(a, []C.Proxy{reject, b}); len(got) != 1 || got[0] != C.Proxy(b) {
+	inner := &typedProxy{askedProxy: askedNode("inner", "", true), kind: C.URLTest}
+	if got := witnesses(a, []C.Proxy{reject, inner, b}); len(got) != 1 || got[0] != C.Proxy(b) {
 		t.Fatalf("witnesses: %d", len(got))
 	}
 }
@@ -463,5 +466,28 @@ func TestFailedConnectionsThatStartedNoCheckMakeNoWaitLonger(t *testing.T) {
 	}
 	if a.asks.Load() != 0 {
 		t.Fatal("the node was asked beside a running check")
+	}
+}
+
+// A group inside the group watches its own nodes: the outer group neither
+// watches the connection once more nor asks about the inner one, and failed
+// connections through it have the whole group checked, as they always had.
+func TestAGroupInsideTheGroupIsNotAskedAbout(t *testing.T) {
+	inner := &typedProxy{askedProxy: askedNode("inner", "", true), kind: C.URLTest}
+	b := askedNode("B", "192.0.2.2", true)
+	provider := &countingProvider{proxies: []C.Proxy{inner, b}}
+	gb := NewGroupBase(GroupBaseOption{Name: "outer", TestTimeout: 300, Providers: []P.ProxyProvider{provider}})
+	d := doubt{url: "http://probe.invalid/", all: gb.healthCheck, next: func(but C.Proxy) []C.Proxy {
+		return aliveBut(gb.GetProxies(false), but, "")
+	}}
+	near, far := net.Pipe()
+	t.Cleanup(func() { _ = near.Close(); _ = far.Close() })
+	conn := outbound.NewConn(near, outbound.NewDirect())
+	if got := gb.watch(conn, inner, time.Now(), d, nil); got != C.Conn(conn) {
+		t.Fatal("a connection through a group inside the group is watched once more")
+	}
+	gb.failedOf(inner, d)
+	if provider.checks.Load() != 1 || inner.asks.Load() != 0 || b.asks.Load() != 0 {
+		t.Fatalf("checks of the group %d, the inner group asked %d times, the node beside %d", provider.checks.Load(), inner.asks.Load(), b.asks.Load())
 	}
 }
