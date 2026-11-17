@@ -33,6 +33,9 @@ type URLTest struct {
 	// fastMu serialises the choice: a Reset of fastSingle while a choice is
 	// being made lets a second one start alongside the first.
 	fastMu sync.Mutex
+	// held is when a check asked for by a doubt of the group's node left the
+	// node alive, zero when its delay has been measured since.
+	held atomic.TypedValue[time.Time]
 }
 
 func (u *URLTest) Now() string {
@@ -116,8 +119,37 @@ func (u *URLTest) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	return u.fast(touch)
 }
 
+// holdSpeed keeps the group on its node whatever delays the check just made
+// has left: a check asked for by failed or unanswered connections measures
+// the node when it is at its worst, it tells alive from dead and no more.
+func (u *URLTest) holdSpeed() {
+	u.held.Store(time.Now())
+	u.fastSingle.Reset()
+}
+
+// speedHeld reports whether the delay of the group's node is the one such a
+// check left. The next probe of the node ends it.
+func (u *URLTest) speedHeld() bool {
+	held := u.held.Load()
+	if held.IsZero() {
+		return false
+	}
+	if lastProbe(u.fastNode, u.testUrl).After(held) {
+		// A hold set meanwhile is another one and stays.
+		u.held.CompareAndSwap(held, time.Time{})
+		return false
+	}
+	return true
+}
+
+// release gives a node that answers again back to the choice.
+func (u *URLTest) release() {
+	u.held.Store(time.Time{})
+	u.fastSingle.Reset()
+}
+
 func (u *URLTest) doubt() doubt {
-	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck}
+	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck, hold: u.holdSpeed}
 }
 
 // nextNodes is the alive nodes of the group without the given one, the best
@@ -258,7 +290,7 @@ func (u *URLTest) pick(touch bool) (C.Proxy, bool) {
 			if fast.AliveForTestUrl(u.testUrl) {
 				u.fastNode = fast
 			}
-		} else if u.score(u.fastNode) > minScore+uint32(u.tolerance) {
+		} else if u.score(u.fastNode) > minScore+uint32(u.tolerance) && !u.speedHeld() {
 			u.fastNode = fast
 		}
 		return u.fastNode, nil
