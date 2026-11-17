@@ -235,6 +235,11 @@ func (gb *GroupBase) noteAnswer(p C.Proxy, born time.Time) {
 }
 
 func (gb *GroupBase) noteSilence(p C.Proxy, born, sent time.Time, ask func()) {
+	// Under the probe hold (network switching, process was paused) it is the
+	// network that is silent, as with a failed dial.
+	if C.ProbeHolding(sent) || C.ProbeHolding(time.Now()) {
+		return
+	}
 	s := &gb.silence
 	s.mu.Lock()
 	// An answer through the node after this request went out: the node
