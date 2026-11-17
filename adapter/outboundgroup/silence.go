@@ -273,8 +273,8 @@ const (
 	verdictNoNetwork
 )
 
-// asked ends a check. After one that left the group where it was the node is
-// not asked about again for the pause, and the pause doubles until a
+// asked ends a check of p. After one that left the group where it was the
+// node is not asked about again for the pause, and the pause doubles until a
 // connection through the node gets an answer:
 //   - the node answered its probe while its connections stayed unanswered:
 //     the site is silent, and more silence does not ask again; failed
@@ -282,11 +282,23 @@ const (
 //     that starts short;
 //   - nobody answered: the network is down, and neither silence nor failures
 //     ask again.
-func (gb *GroupBase) asked(v verdict, failed bool) {
+//
+// A check that found nothing out leaves a short wait and makes none longer.
+// What was found out of p says nothing of the node the group has gone to
+// meanwhile.
+func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	s := &gb.silence
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.asking = false
+	switch s.node {
+	case p:
+	case nil:
+		// Failed connections came before any that opened.
+		s.node = p
+	default:
+		return
+	}
 	now := time.Now()
 	grown := func() time.Time {
 		if s.pause == 0 {
@@ -307,9 +319,8 @@ func (gb *GroupBase) asked(v verdict, failed bool) {
 		s.quietUntil, s.failedQuietUntil = until, until
 	case v == verdictAlive && !failed:
 		s.quietUntil = grown()
-	case failed:
-		// The node answered, or nothing was found out: failed connections
-		// ask again after a wait of their own.
+	case v == verdictAlive:
+		// The node answers while connections through it fail.
 		if s.failedPause == 0 {
 			s.failedPause = silenceAfter
 		}
@@ -317,6 +328,8 @@ func (gb *GroupBase) asked(v verdict, failed bool) {
 		if s.failedPause *= 2; s.failedPause > silencePause {
 			s.failedPause = silencePause
 		}
+	case failed:
+		s.failedQuietUntil = now.Add(silenceAfter)
 	default:
 		s.quietUntil = now.Add(silenceAfter)
 	}
@@ -481,7 +494,7 @@ func (gb *GroupBase) failedOf(p C.Proxy, d doubt) {
 func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 	// The connections opened before p was marked dead go silent after it.
 	if !p.AliveForTestUrl(d.url) || !gb.failedTesting.CompareAndSwap(false, true) {
-		gb.asked(verdictNone, failed)
+		gb.asked(p, verdictNone, failed)
 		return
 	}
 	others := witnesses(p, d.next(p))
@@ -492,14 +505,14 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		switch {
 		case lastProbe(p, d.url).Equal(seen):
 			// Another check of the group was running: this one did not start.
-			gb.asked(verdictNone, failed)
+			gb.asked(p, verdictNone, failed)
 		case p.AliveForTestUrl(d.url):
 			if d.hold != nil {
 				d.hold()
 			}
-			gb.asked(verdictAlive, failed)
+			gb.asked(p, verdictAlive, failed)
 		default:
-			gb.asked(verdictDead, failed)
+			gb.asked(p, verdictDead, failed)
 			gb.leftDead(p, d)
 		}
 		return
@@ -514,7 +527,7 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 	self := answers[0]
 	switch {
 	case !self.known || self.stale(d.url):
-		gb.asked(verdictNone, failed)
+		gb.asked(p, verdictNone, failed)
 		return
 	case self.answered:
 		// A node that answered at its second try beside one that answered
@@ -529,7 +542,7 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 				}
 			}
 		}
-		gb.asked(verdictAlive, failed)
+		gb.asked(p, verdictAlive, failed)
 		return
 	}
 	for _, other := range answers[1:] {
@@ -539,7 +552,7 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		// A probe written to p by someone else meanwhile stands over this
 		// answer: nothing was found out.
 		if !self.replay(d.url) {
-			gb.asked(verdictNone, failed)
+			gb.asked(p, verdictNone, failed)
 			return
 		}
 		for _, each := range answers[1:] {
@@ -552,12 +565,12 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 			reason = "соединения через узел не открываются"
 		}
 		log.Warnln("[Проба] %s: %s, проба тоже — узел помечен мёртвым", p.Name(), reason)
-		gb.asked(verdictDead, failed)
+		gb.asked(p, verdictDead, failed)
 		gb.leftDead(p, d)
 		return
 	}
 	log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())
-	gb.asked(verdictNoNetwork, failed)
+	gb.asked(p, verdictNoNetwork, failed)
 }
 
 // aliveBut is the alive nodes of the list without the given one.

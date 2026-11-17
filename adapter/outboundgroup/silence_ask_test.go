@@ -444,3 +444,24 @@ type typedProxy struct {
 }
 
 func (p *typedProxy) Type() C.AdapterType { return p.kind }
+
+// Failed connections that find another check running start none: the wait
+// before they ask again does not grow for it.
+func TestFailedConnectionsThatStartedNoCheckMakeNoWaitLonger(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
+	gb, _, d := askedGroup(a, b)
+	gb.failedTesting.Store(true)
+	for i := 0; i < 3; i++ {
+		gb.failedOf(a, d)
+		gb.silence.mu.Lock()
+		wait, grown := time.Until(gb.silence.failedQuietUntil), gb.silence.failedPause
+		gb.silence.failedQuietUntil = time.Time{}
+		gb.silence.mu.Unlock()
+		if wait > silenceAfter || grown != 0 {
+			t.Fatalf("a check that did not start left a wait of %s, grown to %s", wait, grown)
+		}
+	}
+	if a.asks.Load() != 0 {
+		t.Fatal("the node was asked beside a running check")
+	}
+}

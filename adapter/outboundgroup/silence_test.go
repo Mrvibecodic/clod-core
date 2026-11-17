@@ -111,7 +111,7 @@ func TestAnAnswerEndsTheWaitOfALostNetwork(t *testing.T) {
 		return now.Before(gb.silence.quietUntil), now.Before(gb.silence.failedQuietUntil)
 	}
 	gb.noteSilence(node, born, time.Now(), func() {})
-	gb.asked(verdictNoNetwork, false)
+	gb.asked(node, verdictNoNetwork, false)
 	if silence, failures := windows(); !silence || !failures {
 		t.Fatalf("no wait after nobody answered: %v, %v", silence, failures)
 	}
@@ -121,10 +121,30 @@ func TestAnAnswerEndsTheWaitOfALostNetwork(t *testing.T) {
 	}
 
 	// The wait of a silent site is not the network's: it stays.
-	gb.asked(verdictAlive, false)
+	gb.asked(node, verdictAlive, false)
 	gb.noteAnswer(node, born)
 	if silence, _ := windows(); !silence {
 		t.Fatal("an answer ended the wait of a silent site")
+	}
+}
+
+// What a check found out of a node is not written to the node the group has
+// gone to while the check ran.
+func TestTheEndOfACheckLeavesTheNextNodeAlone(t *testing.T) {
+	gb, asks := silentGroup(), &askCounter{}
+	a, b := &measuredProxy{name: "A", alive: true}, &measuredProxy{name: "B", alive: true}
+	silent(gb, a, asks, silenceCount)
+	asks.want(t, 1)
+	gb.noteSilence(b, born.Add(time.Second), time.Now(), asks.ask)
+	gb.asked(a, verdictNoNetwork, false)
+	gb.silence.mu.Lock()
+	asking, quiet, lost := gb.silence.asking, time.Now().Before(gb.silence.quietUntil), gb.silence.noNetwork
+	gb.silence.mu.Unlock()
+	if asking {
+		t.Fatal("the check did not end")
+	}
+	if quiet || lost {
+		t.Fatalf("the wait of the node left was put on the next one: quiet %v, lost network %v", quiet, lost)
 	}
 }
 
@@ -134,7 +154,7 @@ func TestThePauseIsOfTheNodeItWasGrownOver(t *testing.T) {
 	a, b := &measuredProxy{name: "A", alive: true}, &measuredProxy{name: "B", alive: true}
 	silent(gb, a, asks, silenceCount)
 	asks.want(t, 1)
-	gb.asked(verdictAlive, false)
+	gb.asked(a, verdictAlive, false)
 	later := born.Add(time.Second)
 	for i := 0; i < silenceCount; i++ {
 		gb.noteSilence(b, later, time.Now(), asks.ask)
@@ -173,7 +193,7 @@ func TestThePauseAfterANodeFoundAliveGrows(t *testing.T) {
 	for i, want := range []time.Duration{silencePause, 2 * silencePause, silencePauseMax, silencePauseMax} {
 		silent(gb, node, asks, silenceCount)
 		asks.want(t, int32(i+1))
-		gb.asked(verdictAlive, false)
+		gb.asked(node, verdictAlive, false)
 		if got := pause(); got != want {
 			t.Fatalf("pause %d is %s, want %s", i+1, got, want)
 		}
@@ -187,7 +207,7 @@ func TestThePauseAfterANodeFoundAliveGrows(t *testing.T) {
 	gb.noteAnswer(node, born)
 	silent(gb, node, asks, silenceCount)
 	asks.want(t, 5)
-	gb.asked(verdictAlive, false)
+	gb.asked(node, verdictAlive, false)
 	if got := pause(); got != silencePause {
 		t.Fatalf("pause after an answer is %s, want %s", got, silencePause)
 	}
@@ -197,7 +217,7 @@ func TestThePauseAfterANodeFoundAliveGrows(t *testing.T) {
 	gb.silence.mu.Unlock()
 	before := asks.n.Load()
 	silent(gb, node, asks, silenceCount)
-	gb.asked(verdictDead, false)
+	gb.asked(node, verdictDead, false)
 	silent(gb, node, asks, silenceCount)
 	asks.want(t, before+2)
 }
