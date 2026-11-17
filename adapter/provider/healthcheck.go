@@ -438,6 +438,9 @@ func probeFlightKey(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16
 
 // probeRun is one URLTest running in the background in held mode.
 type probeRun struct {
+	// fresh: the connections the node kept were set aside before this probe,
+	// it went over a new one.
+	fresh   atomic.Bool
 	started time.Time
 	result  *C.ProbeResult
 	done    chan struct{}
@@ -545,9 +548,22 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 			})
 		})
 		defer abandon.Stop()
+		// Two probes of a node that keeps one connection for all its streams
+		// fail together when that connection is stuck, whatever the server is
+		// like: the second one goes over a new connection.
+		if hedge {
+			run.fresh.Store(retireConns(p))
+		}
 		_, _ = p.URLTest(ctx, url, expectedStatus)
 	}()
 	return run
+}
+
+// retireConns has the streams p opens next go over new connections and
+// reports whether p kept any; the streams of now go on over theirs.
+func retireConns(p C.Proxy) bool {
+	r, ok := p.Adapter().(interface{ RetireConns() bool })
+	return ok && r.RetireConns()
 }
 
 // probe tests p and records the result. A live node whose probe has not
@@ -694,7 +710,10 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 			}
 			// A first probe whose failure was set aside (the network was
 			// switching) is no failure of the node.
-			if !first.finished() || first.result.Held {
+			// A first probe left hanging on a connection set aside since
+			// says that connection was stuck, not that the node is unsteady;
+			// one that failed by itself is the node's failure all the same.
+			if first.finished() && first.result.Held || !first.finished() && !second.fresh.Load() {
 				recorder.RecordSoftFailure(url, first.started)
 			}
 			recorder.RecordProbe(url, second.result)
