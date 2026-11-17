@@ -538,7 +538,7 @@ func TestTheHedgeFitsTheProbeBudget(t *testing.T) {
 		{2 * time.Second, 1300 * time.Millisecond, 1050 * time.Millisecond},
 	} {
 		hc := &HealthCheck{timeout: c.timeout}
-		got := hc.hedgeAt(c.elapsed)
+		got := hc.hedgeAt(c.elapsed, false)
 		if got != c.want {
 			t.Errorf("timeout %s, last probe %s: hedge at %s, want %s", c.timeout, c.elapsed, got, c.want)
 		}

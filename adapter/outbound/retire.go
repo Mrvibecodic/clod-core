@@ -27,3 +27,26 @@ func (p *autoCloseProxyAdapter) RetireConns() bool {
 	r, ok := p.ProxyAdapter.(interface{ RetireConns() bool })
 	return ok && r.RetireConns()
 }
+
+// KeepsConns reports whether the node carries all its streams over connections
+// it keeps: a new stream then opens no new connection.
+func (v *Vless) KeepsConns() bool {
+	return v.gunClient != nil || v.xhttpClient != nil && v.xhttpClient.Pooled()
+}
+
+func (t *Trojan) KeepsConns() bool {
+	return t.gunClient != nil
+}
+
+func (v *Vmess) KeepsConns() bool {
+	return v.gunClient != nil
+}
+
+func (t *Tuic) KeepsConns() bool {
+	return t.client != nil
+}
+
+func (p *autoCloseProxyAdapter) KeepsConns() bool {
+	k, ok := p.ProxyAdapter.(interface{ KeepsConns() bool })
+	return ok && k.KeepsConns()
+}
