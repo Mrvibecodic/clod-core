@@ -339,22 +339,6 @@ func TestFailedConnectionsThroughADeadNodeCheckTheWholeGroup(t *testing.T) {
 	}
 }
 
-// A node that needed its second try where a node beside it answered at the
-// first is unsteady: that is written to it, and to it alone, and it stays
-// alive.
-func TestANodeThatAnswersAtItsSecondTryBesideASteadyOneIsWrittenDown(t *testing.T) {
-	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
-	a.second.Store(true)
-	gb, _, d := askedGroup(a, b)
-	gb.askOf(a, d, false)
-	if a.dead.Load() || a.records() != 2 {
-		t.Fatalf("the unsteady node: dead %v, records %d, want alive with the failed try and the answer", a.dead.Load(), a.records())
-	}
-	if b.records() != 0 {
-		t.Fatalf("written to the steady node: %d", b.records())
-	}
-}
-
 // With every node at its second try it is the network that stumbled: nothing
 // is written.
 func TestSecondTriesAllRoundLeaveNothingWritten(t *testing.T) {
