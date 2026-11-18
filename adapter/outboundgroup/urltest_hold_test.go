@@ -21,7 +21,7 @@ func TestDelaysOfACheckByDoubtDoNotMoveTheGroup(t *testing.T) {
 	a.delay, b.delay = 2000, 50
 	a.probes = append(a.probes, C.DelayHistory{Time: time.Now(), Delay: 2000})
 	time.Sleep(time.Millisecond)
-	group.holdSpeed()
+	group.holdSpeed(a)
 	if got := group.fast(false); got != C.Proxy(a) {
 		t.Fatalf("the group went to %s on the delays of the check", got.Name())
 	}
@@ -39,7 +39,7 @@ func TestADeadNodeIsLeftWhateverIsHeld(t *testing.T) {
 	b := &measuredProxy{name: "B", delay: 300, alive: true}
 	group, _ := measuredGroup(t, []C.Proxy{a, b})
 	group.fast(false)
-	group.holdSpeed()
+	group.holdSpeed(a)
 	a.alive, a.delay = false, 0xffff
 	if got := group.fast(false); got != C.Proxy(b) {
 		t.Fatalf("chosen %s, want B", got.Name())
@@ -52,12 +52,12 @@ func TestANodeGivenBackEndsTheHold(t *testing.T) {
 	b := &measuredProxy{name: "B", delay: 320, alive: true}
 	group, _ := measuredGroup(t, []C.Proxy{a, b})
 	group.fast(false)
-	group.holdSpeed()
+	group.holdSpeed(a)
 	b.delay = 50
 	if got := group.fast(false); got != C.Proxy(a) {
 		t.Fatalf("chosen %s while held, want A", got.Name())
 	}
-	group.release()
+	group.release(a)
 	if got := group.fast(false); got != C.Proxy(b) {
 		t.Fatalf("chosen %s after the release, want B", got.Name())
 	}
