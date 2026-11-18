@@ -479,8 +479,9 @@ func (r *probeRun) finished() bool {
 // startProbe waits for the probe's start slot (probes to one host are spaced
 // out) and then runs the probe in the background: the hedge timer of the
 // caller counts from the probe's own start, not from the wait for the slot.
-// first is the probe this one is the second of, nil for the first.
-func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], first *probeRun) *probeRun {
+// first is the probe this one is the second of, nil for the first. fresh sets
+// the connections the node keeps aside before the probe.
+func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], first *probeRun, fresh bool) *probeRun {
 	hedge := first != nil
 	deadline := time.Now().Add(hc.timeout)
 	if hedge {
@@ -570,8 +571,9 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 		defer abandon.Stop()
 		// Two probes of a node that keeps one connection for all its streams
 		// fail together when that connection is stuck, whatever the server is
-		// like: the second one goes over a new connection.
-		if hedge {
+		// like: the second one goes over a new connection, and so does the
+		// only probe of a dead node, or it could not answer over a stuck one.
+		if fresh {
 			run.fresh.Store(retireConns(p))
 		}
 		_, _ = p.URLTest(ctx, url, expectedStatus)
@@ -649,8 +651,9 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 	// The second probe guards a live node against a false verdict; a dead
 	// node has none to lose, and every live node gets it, the slow ones too.
 	alive := p.AliveForTestUrl(url)
-	hedgeAt := hc.hedgeAt(recorder.LastProbeElapsed(url), keepsConns(p))
-	first := hc.startProbe(p, url, expectedStatus, nil)
+	keeps := keepsConns(p)
+	hedgeAt := hc.hedgeAt(recorder.LastProbeElapsed(url), keeps)
+	first := hc.startProbe(p, url, expectedStatus, nil, !alive && keeps)
 	defer first.cancel()
 	// The hedge delay counts from the probe's own start, not from its wait
 	// for a turn to the host.
@@ -699,7 +702,7 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 		return probeCancelled, nil
 	}
 
-	second := hc.startProbe(p, url, expectedStatus, first)
+	second := hc.startProbe(p, url, expectedStatus, first, true)
 	defer second.cancel()
 	// A closed channel is always ready: once a probe has reported, its channel
 	// is set aside so the select waits for the other one.
