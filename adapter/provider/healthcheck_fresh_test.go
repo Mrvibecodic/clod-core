@@ -91,11 +91,26 @@ func TestAHungProbeOfANodeWithoutKeptConnectionsStaysInTheHistory(t *testing.T) 
 	}
 }
 
-// A first probe that failed by itself is the node's failure whatever
-// connection the second one went over: it stays in the history.
-func TestAFailedFirstProbeStaysInTheHistoryOfANodeWithKeptConnections(t *testing.T) {
+// A first probe that failed while the node keeps shared connections says the
+// connection it went over was broken: the second one, over a new connection,
+// answered, and the node gets no failure in its history for the old one.
+func TestAFailedFirstProbeOverAConnectionSetAsideIsNoMark(t *testing.T) {
 	target := newProbeTarget(t, 0, "bad", "ok")
 	node := &pooledNode{ProxyAdapter: outbound.NewDirect(), keeps: true}
+	outcome, proxy := probeThrough(t, node, target)
+	if outcome != probeRecovered {
+		t.Fatalf("outcome %v", outcome)
+	}
+	if history := delays(proxy.DelayHistoryForTestUrl(target.url())); len(history) != 1 || history[0] == 0 {
+		t.Fatalf("the failure over the old connection must leave no mark: %v", history)
+	}
+}
+
+// A node that keeps nothing went over a new connection both times: its failed
+// first probe stays in the history before the answer.
+func TestAFailedFirstProbeOfANodeWithoutKeptConnectionsStaysInTheHistory(t *testing.T) {
+	target := newProbeTarget(t, 0, "bad", "ok")
+	node := &pooledNode{ProxyAdapter: outbound.NewDirect()}
 	outcome, proxy := probeThrough(t, node, target)
 	if outcome != probeRecovered {
 		t.Fatalf("outcome %v", outcome)
