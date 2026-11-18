@@ -350,6 +350,27 @@ type heldProxy struct {
 	mu      sync.Mutex
 	results []*C.ProbeResult
 	soft    []time.Time
+	// tries is how many tries the node was given, firstAnswered whether the
+	// first of them answered.
+	tries         int
+	firstAnswered bool
+}
+
+// URLTest notes whether the first try answered. The failures written say it
+// less well: a node that keeps shared connections and answered at its second
+// try, over a new connection, has no failure of its hung first try written.
+func (h *heldProxy) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (uint16, error) {
+	h.mu.Lock()
+	h.tries++
+	first := h.tries == 1
+	h.mu.Unlock()
+	delay, err := h.Proxy.URLTest(ctx, url, expectedStatus)
+	if result := C.HeldProbe(ctx); first && result != nil && result.OK() {
+		h.mu.Lock()
+		h.firstAnswered = true
+		h.mu.Unlock()
+	}
+	return delay, err
 }
 
 func (h *heldProxy) RecordProbe(_ string, result *C.ProbeResult) {
@@ -375,7 +396,7 @@ func (h *heldProxy) LastProbeElapsed(url string) time.Duration {
 func (h *heldProxy) steady() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return len(h.soft) == 0
+	return h.firstAnswered
 }
 
 type answer struct {
@@ -383,8 +404,14 @@ type answer struct {
 	// seen is the last probe written to the node before this one.
 	seen time.Time
 	// known is false for a probe that found nothing out: it was cut short or
-	// the network was switching.
-	answered, known bool
+	// the network was switching. steady: the node answered at its first try,
+	// as it stood when the probe ended.
+	answered, known, steady bool
+}
+
+// failed reports whether the node was probed and did not answer.
+func (a answer) failed() bool {
+	return a.known && !a.answered
 }
 
 // stale reports whether the node has been probed by someone else since: what
@@ -426,7 +453,7 @@ func (gb *GroupBase) askHeld(nodes []C.Proxy, d doubt) []answer {
 			defer cancel()
 			_, err := provider.ProbeNode(ctx, held, d.url, expected, timeout)
 			known := err == nil || (ctx.Err() == nil && !errors.Is(err, provider.ErrProbeDiscarded))
-			answers[i] = answer{held: held, seen: seen, answered: err == nil, known: known}
+			answers[i] = answer{held: held, seen: seen, answered: err == nil, known: known, steady: err == nil && held.steady()}
 		}(i, node)
 	}
 	wg.Wait()
@@ -524,16 +551,22 @@ func (gb *GroupBase) failedOf(p C.Proxy, born time.Time, d doubt) {
 //   - p answers: it was the site, nothing is written, so the delay measured at
 //     a bad moment moves the group nowhere. Only a second try p needed where
 //     another node did not is written to p;
-//   - p is silent and another node answers: p is dead, the answers are
-//     written and the group leaves;
-//   - nobody answers, of the few asked first and of the more asked then: it
-//     is the network of the device, and nothing is written. Written down, the
-//     failures would mark every node dead for an outage the nodes had no part
-//     in, and the marks outlive it.
+//   - p is silent and every other node answers at its first try: p is dead,
+//     its answer is written and the group leaves;
+//   - anything else (a node beside it silent too, or answering only at its
+//     second try, or nobody answering) is no proof: a network that stalls and
+//     comes back within the probe looks just so. p and the first few are
+//     asked again, anew, with the more beside them, and that second look
+//     decides alone: p answers, it is alive; p is silent and any node of the
+//     look answers, p is dead; nobody answers, it is the network of the
+//     device, and nothing is written. Written down, the failures would mark
+//     every node dead for an outage the nodes had no part in, and the marks
+//     outlive it.
 //
-// The more are asked together with p and the first few, anew: what those said
-// is seconds old by then, and a network that came back meanwhile would have
-// their silence held against them beside the answers of the more.
+// A node beside p is marked dead only when it was silent at both looks: one
+// look is no proof of it either. What the nodes beside p answered is not
+// written: the group goes by their scheduled probes, not by ones made while
+// the network may have been at its worst.
 //
 // A group with no other node alive has every node checked instead: there is
 // nobody to tell p from the network by.
@@ -578,14 +611,6 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 	nodes := append([]C.Proxy{p}, first...)
 	answers := gb.askHeld(nodes, d)
 	self, others := answers[0], answers[1:]
-	again := len(more) > 0 && self.known && !self.answered && !self.stale(d.url) && !anyAnswered(others)
-	if again {
-		if !fresh {
-			provider.FreshConns(p)
-		}
-		answers = gb.askHeld(append(nodes, more...), d)
-		self, others = answers[0], answers[1:]
-	}
 	switch {
 	case !self.known || self.stale(d.url):
 		end(verdictNone)
@@ -593,12 +618,10 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 	case self.answered:
 		// A node that answered at its second try beside one that answered
 		// at the first is unsteady, and that is written down: url-test ranks
-		// it below the steady ones. With no node steady it is the network,
-		// and so it is after nobody answered: a network coming back gives
-		// one node its answer a try sooner than another.
-		if !again && !self.held.steady() {
+		// it below the steady ones. With no node steady it is the network.
+		if !self.steady {
 			for _, other := range others {
-				if other.answered && other.held.steady() {
+				if other.steady {
 					self.replay(d.url)
 					log.Infoln("[Проба] %s: ответил со второй попытки, узлы рядом — с первой", p.Name())
 					break
@@ -608,10 +631,31 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		end(verdictAlive)
 		return
 	}
-	if !anyAnswered(others) {
-		log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())
-		end(verdictNoNetwork)
-		return
+	var silent []answer
+	if !allSteady(others) {
+		look := others
+		if !fresh {
+			provider.FreshConns(p)
+		}
+		answers = gb.askHeld(append(nodes, more...), d)
+		self, others = answers[0], answers[1:]
+		switch {
+		case !self.known || self.stale(d.url):
+			end(verdictNone)
+			return
+		case self.answered:
+			end(verdictAlive)
+			return
+		case !anyAnswered(others):
+			log.Infoln("[Проба] %s: не ответил ни узел, ни узлы рядом — похоже, нет сети, пометки не меняются", p.Name())
+			end(verdictNoNetwork)
+			return
+		}
+		for i, each := range others[:len(first)] {
+			if each.failed() && look[i].failed() {
+				silent = append(silent, each)
+			}
+		}
 	}
 	// A probe written to p by someone else meanwhile stands over this
 	// answer: nothing was found out.
@@ -619,9 +663,9 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		end(verdictNone)
 		return
 	}
-	for _, each := range others {
-		if each.known {
-			each.replay(d.url)
+	for _, each := range silent {
+		if each.replay(d.url) {
+			log.Warnln("[Проба] %s: не ответил дважды рядом с ответившими — узел помечен мёртвым", each.held.Name())
 		}
 	}
 	reason := "запросы через узел остаются без ответа"
@@ -631,6 +675,17 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 	log.Warnln("[Проба] %s: %s, проба тоже — узел помечен мёртвым", p.Name(), reason)
 	end(verdictDead)
 	gb.leftDead(p, d)
+}
+
+// allSteady reports whether there are answers and every one of them came at
+// the first try.
+func allSteady(answers []answer) bool {
+	for _, each := range answers {
+		if !each.steady {
+			return false
+		}
+	}
+	return len(answers) > 0
 }
 
 func anyAnswered(answers []answer) bool {
