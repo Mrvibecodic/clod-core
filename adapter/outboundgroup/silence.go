@@ -59,6 +59,16 @@ type silence struct {
 	// must not keep a node that refuses connections from being asked about.
 	quietUntil       time.Time
 	failedQuietUntil time.Time
+	// timed is how many of the connections counted ran out their wait, as
+	// opposed to being cut. A check started by cut connections alone (byCuts)
+	// that finds the node alive holds back cut connections only, until
+	// cutQuietUntil: they were the server refusing sites, and they say
+	// nothing of whether the node goes silent after. A check started by
+	// silence while that pause runs (early) takes the next pause in advance,
+	// so the node is asked about no more often than before.
+	timed         int
+	byCuts, early bool
+	cutQuietUntil time.Time
 }
 
 // follows reports whether the connection opened at born through p is one of
@@ -73,6 +83,7 @@ func (s *silence) follows(p C.Proxy, born time.Time) bool {
 	// What was found out of the node before says nothing of this one.
 	s.node, s.since, s.count, s.answeredAt = p, born, 0, time.Time{}
 	s.pause, s.failedPause, s.quietUntil, s.failedQuietUntil, s.noNetwork = 0, 0, time.Time{}, time.Time{}, false
+	s.timed, s.cutQuietUntil = 0, time.Time{}
 	return true
 }
 
@@ -300,7 +311,7 @@ func (gb *GroupBase) noteAnswer(p C.Proxy, born time.Time) {
 	s := &gb.silence
 	s.mu.Lock()
 	if s.follows(p, born) {
-		s.answeredAt, s.count, s.pause, s.failedPause = time.Now(), 0, 0, 0
+		s.answeredAt, s.count, s.timed, s.pause, s.failedPause = time.Now(), 0, 0, 0, 0
 		if s.noNetwork {
 			s.noNetwork, s.quietUntil, s.failedQuietUntil = false, time.Time{}, time.Time{}
 		}
@@ -343,10 +354,20 @@ func (gb *GroupBase) note(p C.Proxy, born, sent time.Time, ask func(), cut bool)
 			return
 		}
 	}
+	now := time.Now()
+	if cut && now.Before(s.cutQuietUntil) {
+		// What a check that found the node alive has just answered.
+		s.mu.Unlock()
+		return
+	}
 	s.count++
-	start := s.count >= silenceCount && !s.asking && !time.Now().Before(s.quietUntil)
+	if !cut {
+		s.timed++
+	}
+	start := s.count >= silenceCount && !s.asking && !now.Before(s.quietUntil)
 	if start {
-		s.count, s.asking = 0, true
+		s.byCuts, s.early = s.timed == 0, now.Before(s.cutQuietUntil)
+		s.count, s.timed, s.asking = 0, 0, true
 	}
 	s.mu.Unlock()
 	if start {
@@ -378,6 +399,10 @@ const (
 //   - nobody answered: the network is down, and neither silence nor failures
 //     ask again.
 //
+// A check that cut connections alone started, and that found the node alive,
+// holds back cut connections only: silence is still counted, and a check it
+// starts meanwhile takes the next pause in advance.
+//
 // A check that found nothing out leaves a short wait and makes none longer.
 // What was found out of p says nothing of the node the group has gone to
 // meanwhile.
@@ -394,11 +419,11 @@ func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	default:
 		return
 	}
-	grown := func() time.Time {
+	grown := func(from time.Time) time.Time {
 		if s.pause == 0 {
 			s.pause = silencePause
 		}
-		until := now.Add(s.pause)
+		until := from.Add(s.pause)
 		if s.pause *= 2; s.pause > silencePauseMax {
 			s.pause = silencePauseMax
 		}
@@ -408,11 +433,23 @@ func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	switch {
 	case v == verdictDead:
 		s.pause, s.failedPause, s.quietUntil, s.failedQuietUntil = 0, 0, time.Time{}, time.Time{}
+		s.cutQuietUntil = time.Time{}
 	case v == verdictNoNetwork:
-		until := grown()
+		until := grown(now)
 		s.quietUntil, s.failedQuietUntil = until, until
+	case v == verdictAlive && !failed && s.byCuts:
+		s.cutQuietUntil = grown(now)
+	case v == verdictAlive && !failed && s.early:
+		// The pause after this check follows the one the cut connections
+		// left: two checks in two pauses, as there were.
+		from := s.cutQuietUntil
+		if from.Before(now) {
+			from = now
+		}
+		s.quietUntil = grown(from)
+		s.cutQuietUntil = s.quietUntil
 	case v == verdictAlive && !failed:
-		s.quietUntil = grown()
+		s.quietUntil = grown(now)
 	case v == verdictAlive:
 		// The node answers while connections through it fail.
 		if s.failedPause == 0 {
@@ -637,7 +674,7 @@ func (gb *GroupBase) failedOf(p C.Proxy, born time.Time, d doubt) {
 	s.mu.Lock()
 	start := s.follows(p, born) && !s.asking && !time.Now().Before(s.failedQuietUntil)
 	if start {
-		s.asking = true
+		s.asking, s.byCuts, s.early = true, false, false
 	}
 	s.mu.Unlock()
 	if start {
