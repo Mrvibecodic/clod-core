@@ -57,6 +57,12 @@ type GroupBase struct {
 	recheckMux      sync.Mutex
 	recheckOf       C.Proxy
 	recheckRestarts int
+	// returned is the node the group last went back to through control
+	// probes, returnedAt when, returnGuardUntil the end of the guard a quick
+	// new leave of it started; see revived.
+	returned         C.Proxy
+	returnedAt       time.Time
+	returnGuardUntil time.Time
 	// probation is the node the series probationOf found alive and makes
 	// its control probes of; see onProbation.
 	probation   C.Proxy
