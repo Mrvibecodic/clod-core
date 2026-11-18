@@ -277,6 +277,7 @@ func readAll(conns []C.Conn) {
 // is noticed at once, not when the scheduled check comes.
 func TestAConnectionCutBeforeItsFirstByteCountsAsSilence(t *testing.T) {
 	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
 	cut, conns := refusedConns(t, gb, node, asks, silenceCount)
 	cut()
 	readAll(conns)
@@ -287,6 +288,7 @@ func TestAConnectionCutBeforeItsFirstByteCountsAsSilence(t *testing.T) {
 // runs out, does not count it again.
 func TestACutConnectionIsNotCountedAgainByItsTimer(t *testing.T) {
 	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
 	cut, conns := refusedConns(t, gb, node, asks, silenceCount-1)
 	cut()
 	readAll(conns)
@@ -298,6 +300,7 @@ func TestACutConnectionIsNotCountedAgainByItsTimer(t *testing.T) {
 // ends it later does not count it again.
 func TestAConnectionCutAfterItsWaitIsNotCountedTwice(t *testing.T) {
 	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
 	cut, conns := refusedConns(t, gb, node, asks, silenceCount-1)
 	time.Sleep(silenceAfter + 200*time.Millisecond)
 	cut()
@@ -309,6 +312,7 @@ func TestAConnectionCutAfterItsWaitIsNotCountedTwice(t *testing.T) {
 // was given up by the app: the error that ends its read counts nothing.
 func TestAConnectionTheLocalSideEndedCountsNothing(t *testing.T) {
 	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
 	_, closed := refusedConns(t, gb, node, asks, silenceCount)
 	for _, conn := range closed {
 		_ = conn.Close()
@@ -330,6 +334,7 @@ func TestAConnectionTheLocalSideEndedCountsNothing(t *testing.T) {
 // unanswered, and the read that fails after it counts nothing either.
 func TestAFailedWriteCountsNoSilence(t *testing.T) {
 	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
 	for i := 0; i < silenceCount; i++ {
 		conn := &watchedConn{Conn: failingConn{}, gb: gb, node: node, born: time.Now(), ask: asks.ask}
 		if _, err := conn.Write([]byte("ping")); err == nil {
@@ -339,6 +344,66 @@ func TestAFailedWriteCountsNoSilence(t *testing.T) {
 	}
 	time.Sleep(silenceAfter + 200*time.Millisecond)
 	asks.want(t, 0)
+}
+
+// takenLongAgo has the group on node since well before silenceAfter, with no
+// answer through it since: a cut is counted.
+func takenLongAgo(gb *GroupBase, node C.Proxy) {
+	gb.silence.mu.Lock()
+	gb.silence.node, gb.silence.since = node, time.Now().Add(-silenceAfter-time.Second)
+	gb.silence.mu.Unlock()
+}
+
+// Connections cut right after an answer through the node are cut by the
+// server for their sites, as a server that blocks some of them does: they
+// are no silence of the node.
+func TestACutSoonAfterAnAnswerIsNoSilence(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
+	gb.noteAnswer(node, born)
+	cut, conns := refusedConns(t, gb, node, asks, silenceCount)
+	cut()
+	readAll(conns)
+	time.Sleep(silenceAfter + 200*time.Millisecond)
+	asks.want(t, 0)
+}
+
+// Connections cut through a node the group has only just taken are not
+// counted either: a node that cuts everything is noticed silenceAfter later.
+func TestCutsThroughANodeJustTakenAreNoSilence(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	cut, conns := refusedConns(t, gb, node, asks, silenceCount)
+	cut()
+	readAll(conns)
+	asks.want(t, 0)
+}
+
+// A node that has answered nothing for silenceAfter and cuts every
+// connection is still asked about at the third cut.
+func TestANodeThatCutsEverythingIsAskedAboutAtTheThirdCut(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
+	gb.silence.mu.Lock()
+	gb.silence.answeredAt = time.Now().Add(-silenceAfter - 100*time.Millisecond)
+	gb.silence.mu.Unlock()
+	cut, conns := refusedConns(t, gb, node, asks, silenceCount-1)
+	cut()
+	readAll(conns)
+	asks.want(t, 0)
+	cut, conns = refusedConns(t, gb, node, asks, 1)
+	cut()
+	readAll(conns)
+	asks.want(t, 1)
+}
+
+// Connections left without a byte back are counted by their timer however
+// soon after an answer they were opened.
+func TestSilenceRightAfterAnAnswerIsStillCounted(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	gb.noteAnswer(node, born)
+	_, _ = refusedConns(t, gb, node, asks, silenceCount)
+	time.Sleep(silenceAfter + 200*time.Millisecond)
+	asks.want(t, 1)
 }
 
 // failingConn fails every write and read, as a connection whose handshake

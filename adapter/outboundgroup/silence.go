@@ -155,11 +155,12 @@ func (c *watchedConn) settle(answered bool) {
 }
 
 // refused ends the watch of a connection that got an error in place of its
-// first byte back. After a request went out whole that is a connection the
-// node left unanswered, as one whose wait ran out is: a server that takes
-// connections and drops every request says so at once. An error after a
-// failed write, or after the local side let its deadline pass, says nothing
-// of the node; a connection the local side closed first is settled already.
+// first byte back. After a request went out whole that may be a connection
+// the node left unanswered, as one whose wait ran out is: a server that takes
+// connections and drops every request says so at once. noteCut decides. An
+// error after a failed write, or after the local side let its deadline pass,
+// says nothing of the node; a connection the local side closed first is
+// settled already.
 func (c *watchedConn) refused(err error) {
 	if !c.delivered.Load() || localEnd(err) {
 		c.settle(false)
@@ -175,7 +176,7 @@ func (c *watchedConn) refused(err error) {
 	sent := c.sent
 	c.mu.Unlock()
 	if c.counted.CompareAndSwap(false, true) {
-		c.gb.noteSilence(c.node, c.born, sent, c.ask)
+		c.gb.noteCut(c.node, c.born, sent, c.ask)
 	}
 }
 
@@ -307,7 +308,23 @@ func (gb *GroupBase) noteAnswer(p C.Proxy, born time.Time) {
 	s.mu.Unlock()
 }
 
+// noteSilence counts a connection whose wait for its first byte ran out.
 func (gb *GroupBase) noteSilence(p C.Proxy, born, sent time.Time, ask func()) {
+	gb.note(p, born, sent, ask, false)
+}
+
+// noteCut counts a connection cut before its first byte, but only one whose
+// request went out at least silenceAfter after the node last answered and
+// after the group took the node. A server that blocks some sites closes their
+// connections at once, a page opens a few of them in a burst, and nothing
+// answers in between: cut so soon after an answer, a connection says the
+// site is refused, not that the node is. A server that cuts everything has
+// answered nothing for that long by its third cut.
+func (gb *GroupBase) noteCut(p C.Proxy, born, sent time.Time, ask func()) {
+	gb.note(p, born, sent, ask, true)
+}
+
+func (gb *GroupBase) note(p C.Proxy, born, sent time.Time, ask func(), cut bool) {
 	// Under the probe hold (network switching, process was paused) it is the
 	// network that is silent, as with a failed dial.
 	if C.ProbeHolding(sent) || C.ProbeHolding(time.Now()) {
@@ -320,6 +337,16 @@ func (gb *GroupBase) noteSilence(p C.Proxy, born, sent time.Time, ask func()) {
 	if !s.follows(p, born) || s.answeredAt.After(sent) {
 		s.mu.Unlock()
 		return
+	}
+	if cut {
+		since := s.since
+		if s.answeredAt.After(since) {
+			since = s.answeredAt
+		}
+		if sent.Before(since.Add(silenceAfter)) {
+			s.mu.Unlock()
+			return
+		}
 	}
 	s.count++
 	start := s.count >= silenceCount && !s.asking && !time.Now().Before(s.quietUntil)
