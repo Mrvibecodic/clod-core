@@ -466,7 +466,9 @@ const probeHedgeDelay = time.Second
 // probe: given ProbeHedgeDelay, its timeout and C.ProbeReserve, it ends with
 // its verdict before that deadline, the wait for its turn to the host
 // included; probeAbandonGrace more when a connection does not end by its
-// deadline, and then the probe found nothing out.
+// deadline, and then the probe found nothing out. A second try that starts
+// after the hedge delay keeps its whole timeout only with ProbeReserve more:
+// the first try may have waited that long for its turn.
 const ProbeHedgeDelay = probeHedgeDelay
 
 // probeHedgeGrace is how long the first probe still gets once the second one

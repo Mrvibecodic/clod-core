@@ -509,7 +509,7 @@ func (gb *GroupBase) askHeld(nodes []C.Proxy, d doubt) []answer {
 			defer wg.Done()
 			held := &heldProxy{Proxy: node}
 			seen := lastProbe(node, d.url)
-			ctx, cancel := context.WithTimeout(context.Background(), provider.ProbeHedgeDelay+timeout+C.ProbeReserve)
+			ctx, cancel := context.WithTimeout(context.Background(), probeBudget(timeout))
 			defer cancel()
 			_, err := provider.ProbeNode(ctx, held, d.url, expected, timeout)
 			known := err == nil || (ctx.Err() == nil && !errors.Is(err, provider.ErrProbeDiscarded))
