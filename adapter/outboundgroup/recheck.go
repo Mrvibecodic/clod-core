@@ -20,11 +20,17 @@ var recheckPauses = []time.Duration{15 * time.Second, 30 * time.Second, time.Min
 // series to take its answer instead of probing the node itself.
 const recheckFresh = 10 * time.Second
 
-// leftDead has p, the node the group was on when a check out of schedule
-// found it dead, probed again ahead of the scheduled check. Only the last
-// node left is probed.
+// leftDead has p, a node the group left because it was found dead, probed
+// again ahead of the scheduled check. Only the last node left is probed. A
+// series that already follows p goes on as it is: a check that found p dead
+// and the group that left it then both tell of the one leave.
 func (gb *GroupBase) leftDead(p C.Proxy, d doubt) {
-	gb.recheck(p, d, recheckPauses)
+	gb.recheckMux.Lock()
+	following := gb.recheckOf == p
+	gb.recheckMux.Unlock()
+	if !following {
+		gb.recheck(p, d, recheckPauses)
+	}
 }
 
 // recheck probes p after each of the pauses. The series ends when p is
@@ -37,9 +43,13 @@ func (gb *GroupBase) recheck(p C.Proxy, d doubt, pauses []time.Duration) {
 	if p.AliveForTestUrl(d.url) {
 		return
 	}
+	gb.recheckMux.Lock()
 	series := gb.rechecks.Add(1)
+	gb.recheckOf = p
+	gb.recheckMux.Unlock()
 	seen := lastProbe(p, d.url)
 	go func() {
+		defer gb.recheckEnded(series)
 		timeout := time.Duration(gb.testTimeout) * time.Millisecond
 		expected, _ := utils.NewUnsignedRanges[uint16](d.expected)
 		for _, pause := range pauses {
@@ -62,6 +72,15 @@ func (gb *GroupBase) recheck(p C.Proxy, d doubt, pauses []time.Duration) {
 			seen = lastProbe(p, d.url)
 		}
 	}()
+}
+
+// recheckEnded marks the series over unless a newer one has taken its place.
+func (gb *GroupBase) recheckEnded(series int32) {
+	gb.recheckMux.Lock()
+	if gb.rechecks.Load() == series {
+		gb.recheckOf = nil
+	}
+	gb.recheckMux.Unlock()
 }
 
 // rechecking reports whether the series is still the group's latest and p

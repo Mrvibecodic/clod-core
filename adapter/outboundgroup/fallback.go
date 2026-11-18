@@ -22,6 +22,8 @@ type Fallback struct {
 	testUrl        string
 	selected       atomic.TypedValue[string]
 	expectedStatus string
+	// on is the alive node the group went to last.
+	on atomic.TypedValue[C.Proxy]
 }
 
 func (f *Fallback) Now() string {
@@ -137,7 +139,20 @@ func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 		// Only the selection that was passed over: one set meanwhile stays.
 		f.selected.CompareAndSwap(selected, "")
 	}
+	f.wentTo(proxy)
 	return proxy
+}
+
+// wentTo notes the node the group goes to. The node it moves off, if that is
+// dead, is probed again ahead of the scheduled check: the group goes back to
+// it as soon as it answers. With every node dead the group goes nowhere.
+func (f *Fallback) wentTo(proxy C.Proxy) {
+	if !proxy.AliveForTestUrl(f.testUrl) || f.on.Load() == proxy {
+		return
+	}
+	if last := f.on.Swap(proxy); last != nil && last != proxy && !last.AliveForTestUrl(f.testUrl) {
+		f.leftDead(last, f.doubt())
+	}
 }
 
 // CurrentNode is the node the group would dial now. Unlike a dial, it does

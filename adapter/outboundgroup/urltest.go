@@ -249,6 +249,8 @@ func anyAlive(proxies []C.Proxy, url string) bool {
 }
 
 func (u *URLTest) pick(touch bool) (C.Proxy, bool) {
+	// left is the dead node the choice moved off, if it did.
+	var left C.Proxy
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		u.fastMu.Lock()
 		defer u.fastMu.Unlock()
@@ -313,13 +315,18 @@ func (u *URLTest) pick(touch bool) (C.Proxy, bool) {
 			// With every node dead there is nowhere to go: the group stays
 			// where it is rather than move to the first of the list.
 			if fast.AliveForTestUrl(u.testUrl) {
-				u.fastNode = fast
+				left, u.fastNode = u.fastNode, fast
 			}
 		} else if u.score(u.fastNode) > minScore+uint32(u.tolerance) && !u.speedHeld() {
 			u.fastNode = fast
 		}
 		return u.fastNode, nil
 	})
+	// Whoever found the node dead, the group has left it: it is probed again
+	// ahead of the scheduled check.
+	if left != nil {
+		u.leftDead(left, u.doubt(left))
+	}
 	return elm, shared
 }
 
