@@ -36,13 +36,15 @@ var (
 // aside and still open, the stream connections are always set aside, however
 // many they are: a pool as large as the server asks for is set aside whole
 // once. Past that, nothing more is set aside and the streams go on as they did
-// while the connections set aside and still open, with the stream connections,
-// would go past retireLimit. The stream connections come first: the packet
-// connections are set aside with them only while that keeps to retireLimit,
-// first time or not, and stay where they are otherwise, so a packet session
-// that runs for minutes on a connection set aside does not keep the next
-// stream connections in place. A pool with packet connections alone has them
-// set aside if they fit.
+// while the connections set aside and still open, with the stream connections
+// that carry streams, would go past retireLimit. Those without a stream do not
+// count, here or below: they are set aside with the rest and close once
+// retireGrace has passed since they were last taken. The stream connections
+// come first: the packet connections are set aside with them only while that
+// keeps to retireLimit, first time or not, and stay where they are otherwise,
+// so a packet session that runs for minutes on a connection set aside does
+// not keep the next stream connections in place. A pool with packet
+// connections alone has them set aside if they fit.
 func (t *PoolClient) Retire() bool {
 	retiredMu.Lock()
 	defer retiredMu.Unlock()
@@ -60,8 +62,14 @@ func (t *PoolClient) Retire() bool {
 		return found
 	}
 	tcp, udp := collect(&t.tcpClients), collect(&t.udpClients)
+	busy := 0
+	for _, client := range tcp {
+		if client.OpenStreams() > 0 {
+			busy++
+		}
+	}
 	n := len(retired[t])
-	if n > 0 && n+len(tcp) > retireLimit {
+	if n > 0 && n+busy > retireLimit {
 		return false
 	}
 	var old []Client
@@ -69,7 +77,7 @@ func (t *PoolClient) Retire() bool {
 		t.tcpClients.Init()
 		old = append(old, tcp...)
 	}
-	if len(udp) > 0 && n+len(tcp)+len(udp) <= retireLimit {
+	if len(udp) > 0 && n+busy+len(udp) <= retireLimit {
 		t.udpClients.Init()
 		old = append(old, udp...)
 	}
