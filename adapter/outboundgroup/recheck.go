@@ -25,6 +25,7 @@ const recheckFresh = 10 * time.Second
 // series that already follows p goes on as it is: a check that found p dead
 // and the group that left it then both tell of the one leave.
 func (gb *GroupBase) leftDead(p C.Proxy, d doubt) {
+	gb.noteLeave(p)
 	gb.recheckMux.Lock()
 	following := gb.recheckOf == p
 	gb.recheckMux.Unlock()
@@ -39,6 +40,14 @@ func (gb *GroupBase) leftDead(p C.Proxy, d doubt) {
 // gone back to, and neither is one that goes down for longer than a pause
 // within that minute.
 var recheckControlPauses = []time.Duration{15 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second}
+
+// recheckReturnGuard is how long after a url-test group went back to a node
+// through its control probes a new leave of that node counts as the node
+// failing the return, and how long from that leave its revival takes no
+// control probes: the group goes back to it only as its scheduled checks
+// rank it. A node that flaps slower than the control probes reach would
+// have the group come and go with it otherwise.
+var recheckReturnGuard = 10 * time.Minute
 
 // recheckRestarts is how many times in a row the series of one node starts
 // over after a control probe it failed. A node that keeps coming and going
@@ -130,7 +139,9 @@ func (gb *GroupBase) recheckTurn(p C.Proxy, d doubt, seen time.Time) time.Time {
 // that is up for a moment and down again is not gone back to: its failures
 // stay in the records the group ranks it by. Neither is one that passed the
 // control probes with a failure still among the records it is ranked by, a
-// try a control probe needed included: the scheduled checks rank it.
+// try a control probe needed included: the scheduled checks rank it. Nor is
+// one that the group went back to this way and left dead again soon after,
+// for recheckReturnGuard from that leave: it gets no control probes then.
 // While its control probes run, p is on probation: the group does not go to
 // it for its speed, which its clean records would have it do long before
 // the last one.
@@ -138,6 +149,16 @@ func (gb *GroupBase) recheckTurn(p C.Proxy, d doubt, seen time.Time) time.Time {
 // Any other group takes p back as soon as it is alive.
 func (gb *GroupBase) revived(p C.Proxy, d doubt, series int32, anew func(), controls []time.Duration) {
 	if gb.Type() == C.URLTest {
+		gb.recheckMux.Lock()
+		guarded := gb.returned == p && time.Now().Before(gb.returnGuardUntil)
+		if guarded && gb.rechecks.Load() == series {
+			gb.recheckRestarts = 0
+		}
+		gb.recheckMux.Unlock()
+		if guarded {
+			log.Infoln("[Проба] %s снова отвечает; недавно возвращался и упал — возврат теперь только по плановым проверкам", p.Name())
+			return
+		}
 		// Until the control probes are over the group does not go to p for
 		// its speed: three clean records are enough for that, and p would
 		// be gone back to before most of its control probes.
@@ -167,11 +188,44 @@ func (gb *GroupBase) revived(p C.Proxy, d doubt, series int32, anew func(), cont
 		if !cleanWindow(p, d.url) {
 			return
 		}
+		gb.recheckMux.Lock()
+		gb.returned, gb.returnedAt, gb.returnGuardUntil = p, time.Now(), time.Time{}
+		gb.recheckMux.Unlock()
 		log.Infoln("[Проба] %s: контрольные пробы прошли, узел снова в выборе", p.Name())
 	}
 	if d.again != nil {
 		d.again()
 	}
+}
+
+// noteLeave notes that the group leaves p dead. A leave of the node the group
+// went back to through control probes, within recheckReturnGuard of that
+// return, starts the guard: see revived. A node a provider update has taken
+// out of the group is forgotten.
+func (gb *GroupBase) noteLeave(p C.Proxy) {
+	gb.recheckMux.Lock()
+	returned := gb.returned
+	gb.recheckMux.Unlock()
+	if returned == nil {
+		return
+	}
+	if !gb.hasNode(returned) {
+		gb.recheckMux.Lock()
+		if gb.returned == returned {
+			gb.returned = nil
+		}
+		gb.recheckMux.Unlock()
+		return
+	}
+	if returned != p {
+		return
+	}
+	now := time.Now()
+	gb.recheckMux.Lock()
+	if gb.returned == p && now.Sub(gb.returnedAt) < recheckReturnGuard && !now.Before(gb.returnedAt) && !now.Before(gb.returnGuardUntil) {
+		gb.returnGuardUntil = now.Add(recheckReturnGuard)
+	}
+	gb.recheckMux.Unlock()
 }
 
 // cleanWindow reports whether the records p is ranked by, the last
@@ -227,6 +281,11 @@ func (gb *GroupBase) rechecking(p C.Proxy, series int32) bool {
 	if gb.rechecks.Load() != series {
 		return false
 	}
+	return gb.hasNode(p)
+}
+
+// hasNode reports whether p is one of the group's nodes.
+func (gb *GroupBase) hasNode(p C.Proxy) bool {
 	for _, proxy := range gb.GetProxies(false) {
 		if proxy == p {
 			return true

@@ -271,6 +271,55 @@ func TestANodeThatDiesBeforeTheLastControlProbeIsNotGoneBackTo(t *testing.T) {
 	}
 }
 
+// The node a url-test group went back to through control probes and left
+// dead again soon after is gone back to by its scheduled checks alone: its
+// next revival takes no control probes and asks for no new choice, for
+// recheckReturnGuard from that leave. After that the control probes take it
+// back again.
+func TestANodeThatFailedItsReturnGetsNoControlProbesForAWhile(t *testing.T) {
+	a, b := scripted("A", 10, true), scripted("B", 300, true)
+	group := controlGroup(t, a, b)
+	var agains atomic.Int32
+	d := group.doubt(a)
+	d.again = func() { agains.Add(1) }
+	controls := int32(len(recheckControlPauses))
+	pause := 10 * time.Millisecond
+	ended := func() bool { n, _ := followed(group.GroupBase); return n == nil }
+	leave := func() {
+		a.record(0)
+		group.noteLeave(a)
+		group.recheckEvery(a, d, []time.Duration{pause}, controlsOf(pause), 0)
+	}
+
+	// It passes all the control probes: the group goes back to it once.
+	group.recheckEvery(a, d, []time.Duration{pause}, controlsOf(pause), 0)
+	waitFor(t, 3*time.Second, "the series did not end", ended)
+	if a.asks.Load() != 1+controls || agains.Load() != 1 {
+		t.Fatalf("probes %d, choices anew %d, want %d and 1", a.asks.Load(), agains.Load(), 1+controls)
+	}
+
+	// Left dead within the guard of that return and alive again: no
+	// control probes, no choice anew.
+	leave()
+	waitFor(t, 3*time.Second, "the series did not find the node alive", func() bool { return a.asks.Load() == 2+controls })
+	waitFor(t, 3*time.Second, "the series did not end", ended)
+	time.Sleep(300 * time.Millisecond)
+	if a.asks.Load() != 2+controls || agains.Load() != 1 {
+		t.Fatalf("probes %d, choices anew %d after a failed return, want %d and 1", a.asks.Load(), agains.Load(), 2+controls)
+	}
+
+	// The guard is over: the control probes take the node back again.
+	group.recheckMux.Lock()
+	group.returnedAt = time.Now().Add(-2 * recheckReturnGuard)
+	group.returnGuardUntil = time.Now().Add(-time.Millisecond)
+	group.recheckMux.Unlock()
+	leave()
+	waitFor(t, 3*time.Second, "the control probes did not take the node back", func() bool { return agains.Load() == 2 })
+	if a.asks.Load() != 3+2*controls {
+		t.Fatalf("probes %d, want %d", a.asks.Load(), 3+2*controls)
+	}
+}
+
 // phasedNode is down for the first down of every period from its start, up
 // for the rest of it, and up for good from steady on.
 type phasedNode struct {
