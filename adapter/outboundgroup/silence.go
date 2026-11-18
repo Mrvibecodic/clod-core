@@ -295,6 +295,7 @@ func isGroup(p C.Proxy) bool {
 }
 
 func (gb *GroupBase) noteAnswer(p C.Proxy, born time.Time) {
+	gb.failedDeadOver()
 	s := &gb.silence
 	s.mu.Lock()
 	if s.follows(p, born) {
@@ -582,10 +583,9 @@ func witnesses(p C.Proxy, next []C.Proxy) (first, more []C.Proxy) {
 	return first, more
 }
 
-// failedOf answers the connections through p that failed. A group that is on
-// a dead node already has every node checked, as it always had: there is
-// nothing to lose, and the nodes that are back are found. So has a group
-// whose node is not a server of its own.
+// failedOf answers the connections through p that failed. Those of a node
+// marked dead are answered by failedDead. A group whose node is not a server
+// of its own has every node checked, as it always had.
 //
 // born is when the group took p for the connection that failed. A failed
 // connection is one of the node the group is on as much as one that opened:
@@ -593,7 +593,11 @@ func witnesses(p C.Proxy, next []C.Proxy) (first, more []C.Proxy) {
 // check leaves is its own. The failures of a node the group has left ask
 // nothing.
 func (gb *GroupBase) failedOf(p C.Proxy, born time.Time, d doubt) {
-	if !carries(p) || !p.AliveForTestUrl(d.url) {
+	if !p.AliveForTestUrl(d.url) {
+		gb.failedDead(p, d)
+		return
+	}
+	if !carries(p) {
 		d.all()
 		return
 	}

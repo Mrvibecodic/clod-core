@@ -44,6 +44,12 @@ type GroupBase struct {
 	reviveMux  sync.Mutex
 	reviveNext time.Time
 	reviveWait time.Duration
+	// failedDeadNext is when failed connections through a dead node may have
+	// the whole group checked again, failedDeadPause the pause after that;
+	// see failedDead.
+	failedDeadMux   sync.Mutex
+	failedDeadNext  time.Time
+	failedDeadPause time.Duration
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex

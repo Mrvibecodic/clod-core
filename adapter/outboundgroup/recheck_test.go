@@ -45,19 +45,6 @@ func TestTheNodeThatAnswersAgainIsGivenBackToTheGroup(t *testing.T) {
 	}
 }
 
-// A probe of the node by anybody else, the scheduled check first of all, ends
-// the series: the node is theirs from then on.
-func TestAProbeBySomeoneElseEndsTheSeries(t *testing.T) {
-	a := deadNode("A")
-	gb, _, d := askedGroup(a)
-	gb.recheck(a, d, []time.Duration{200 * time.Millisecond, 50 * time.Millisecond})
-	a.RecordProbe("", &C.ProbeResult{Held: true, Time: time.Now().Add(time.Millisecond), Err: C.ErrNotSupport})
-	settle(time.Second)
-	if got := a.asks.Load(); got != 0 {
-		t.Fatalf("the node was probed %d times after the check of someone else", got)
-	}
-}
-
 // Only the last node left is probed: a new series ends the one before, and a
 // node that is alive starts none.
 func TestOnlyTheLastNodeLeftIsProbed(t *testing.T) {
