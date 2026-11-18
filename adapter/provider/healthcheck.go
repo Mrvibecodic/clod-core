@@ -205,6 +205,7 @@ func (hc *HealthCheck) runRound(all []C.Proxy) {
 		log.Warnln("[Проба] за проверку первая проба зависла или оборвалась у %d из %d узлов: повторная прошла у %d, не прошла у %d",
 			stalls, tally.total.Load(), tally.recovered.Load(), tally.stalled.Load())
 	}
+	hc.lookAgain(proxies, tally)
 	tally.reportDown(len(proxies))
 	log.Debugln("Finish A Health Checking {%s}", id)
 }
@@ -272,11 +273,21 @@ func (hc *HealthCheck) checkOne(p C.Proxy, url, uid string, expectedStatus utils
 	// A node that was already dead stalls every round: it says nothing
 	// about the local side, which is what the round's count is about.
 	wasAlive := p.AliveForTestUrl(url)
-	outcome, result := hc.probe(p, url, expectedStatus)
+	// The failure of a live node waits for the end of the round: see
+	// lookAgain.
+	var hold *heldProbe
+	if wasAlive {
+		hold = &heldProbe{}
+	}
+	outcome, result := hc.probeWith(p, url, expectedStatus, probeHow{hold: hold})
+	if outcome == probePassed || outcome == probeRecovered || outcome == probeShared && result != nil && result.OK() {
+		tally.answered.Add(1)
+	}
 	if outcome == probeCancelled || outcome == probeShared {
 		return
 	}
 	tally.total.Add(1)
+	tally.probedNode(p)
 	switch outcome {
 	case probeRecovered:
 		tally.recovered.Add(1)
@@ -285,10 +296,137 @@ func (hc *HealthCheck) checkOne(p C.Proxy, url, uid string, expectedStatus utils
 			tally.stalled.Add(1)
 		}
 	}
+	if hold != nil {
+		if outcome == probeStalled {
+			tally.holdBack(heldNode{p: p, url: url, expectedStatus: expectedStatus, hold: hold})
+		} else {
+			hold.replay(url)
+		}
+	}
 	if wasAlive && !p.AliveForTestUrl(url) {
 		tally.noteDown(p.Name(), result)
 	}
 	log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
+}
+
+// roundRetryDelay is how long a round that heard from no node waits before it
+// probes them again: a network that was switching or waking up is back by
+// then, one that is gone is still gone.
+var roundRetryDelay = 10 * time.Second
+
+// heldNode is a live node whose probe failed in a round, with what the probe
+// would have written to it.
+type heldNode struct {
+	p              C.Proxy
+	url            string
+	expectedStatus utils.IntRanges[uint16]
+	hold           *heldProbe
+}
+
+// lookAgain decides about the live nodes whose probes failed in the round. A
+// stall of the device's network for a few seconds at the round's time (Wi-Fi
+// to LTE, a laptop waking up) fails every probe in flight: the nodes probed
+// first, the ones the groups use, fail while the later ones pass. If any node
+// of the round answered, the network was there: each of them is probed once
+// more, a whole probe over a new connection, and only that probe is recorded.
+// If none did and there were two or more, it is the network of the device:
+// nothing is recorded, they are probed again after roundRetryDelay, and what
+// that finds is recorded as it is, a long outage too. A round of one node
+// says nothing about the network: its result stands.
+func (hc *HealthCheck) lookAgain(order []C.Proxy, tally *probeTally) {
+	held := tally.held
+	if len(held) == 0 {
+		return
+	}
+	if tally.answered.Load() == 0 {
+		if len(tally.probed) < 2 {
+			for _, node := range held {
+				node.hold.replay(node.url)
+				if !node.p.AliveForTestUrl(node.url) {
+					tally.noteDown(node.p.Name(), lastResult(node.hold))
+				}
+			}
+			return
+		}
+		log.Warnln("[Проба] плановая проверка: не ответил ни один узел — похоже, нет сети, проверка повторится")
+		if hc.listReplaced() {
+			// The round takes the new list next.
+			return
+		}
+		timer := time.NewTimer(roundRetryDelay)
+		select {
+		case <-timer.C:
+		case <-hc.ctx.Done():
+			timer.Stop()
+			return
+		}
+	}
+	rank := make(map[C.Proxy]int, len(order))
+	for i, p := range order {
+		rank[p] = i
+	}
+	sort.SliceStable(held, func(i, j int) bool { return rank[held[i].p] < rank[held[j].p] })
+	b := new(errgroup.Group)
+	b.SetLimit(10)
+	for _, node := range held {
+		node := node
+		b.Go(func() error {
+			if hc.listReplaced() {
+				return nil
+			}
+			outcome, result := hc.probeWith(node.p, node.url, node.expectedStatus, probeHow{fresh: true})
+			if outcome == probeCancelled {
+				return nil
+			}
+			if node.p.AliveForTestUrl(node.url) {
+				log.Debugln("[Проба] %s: в проверке не ответил, при повторном заходе ответил: %s", node.p.Name(), probeReason(result))
+			} else {
+				tally.noteDown(node.p.Name(), result)
+			}
+			return nil
+		})
+	}
+	_ = b.Wait()
+}
+
+// heldProbe keeps what a probe writes to a node, for the round to write once
+// it knows what the probe means. One probe writes to it, from one goroutine.
+type heldProbe struct {
+	to      C.ProbeRecorder
+	results []*C.ProbeResult
+	soft    []time.Time
+}
+
+func (h *heldProbe) RecordProbe(_ string, result *C.ProbeResult) {
+	h.results = append(h.results, result)
+}
+
+func (h *heldProbe) RecordSoftFailure(_ string, at time.Time) {
+	h.soft = append(h.soft, at)
+}
+
+func (h *heldProbe) LastProbeElapsed(url string) time.Duration {
+	return h.to.LastProbeElapsed(url)
+}
+
+// replay writes what the probe found to the node, in the order it found it.
+func (h *heldProbe) replay(url string) {
+	if h.to == nil {
+		return
+	}
+	for _, at := range h.soft {
+		h.to.RecordSoftFailure(url, at)
+	}
+	for _, result := range h.results {
+		h.to.RecordProbe(url, result)
+	}
+}
+
+func lastResult(h *heldProbe) *C.ProbeResult {
+	if len(h.results) == 0 {
+		return nil
+	}
+	return h.results[len(h.results)-1]
 }
 
 // alternateHosts orders proxies so that nodes of one host do not stand in a
@@ -409,11 +547,31 @@ const (
 // DNS, the way to the servers) rather than at the nodes.
 type probeTally struct {
 	total, recovered, stalled atomic.Int32
+	// answered counts the probes some node answered: the network was there.
+	answered atomic.Int32
 
 	// down are the nodes the round took down, reported in one line: when the
 	// network is gone every node goes down, and a line per node buries the log.
 	mu   sync.Mutex
 	down map[string]string // node name: why its probe failed
+	held []heldNode        // live nodes whose probes failed, not recorded yet
+	// probed are the nodes the round probed itself, on any URL.
+	probed map[C.Proxy]struct{}
+}
+
+func (t *probeTally) probedNode(p C.Proxy) {
+	t.mu.Lock()
+	if t.probed == nil {
+		t.probed = map[C.Proxy]struct{}{}
+	}
+	t.probed[p] = struct{}{}
+	t.mu.Unlock()
+}
+
+func (t *probeTally) holdBack(node heldNode) {
+	t.mu.Lock()
+	t.held = append(t.held, node)
+	t.mu.Unlock()
 }
 
 func (t *probeTally) noteDown(name string, result *C.ProbeResult) {
@@ -646,12 +804,29 @@ func keepsConns(p C.Proxy) bool {
 // cannot be used is not retried. The result returned is the recorded one that
 // decided the outcome, nil if none was.
 func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
+	return hc.probeWith(p, url, expectedStatus, probeHow{})
+}
+
+// probeHow is what a round asks of a probe beyond the usual.
+type probeHow struct {
+	// hold keeps what the probe would write to the node.
+	hold *heldProbe
+	// fresh has the first try of a node that keeps shared connections go
+	// over a new one too.
+	fresh bool
+}
+
+func (hc *HealthCheck) probeWith(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], how probeHow) (probeOutcome, *C.ProbeResult) {
 	recorder, ok := p.(C.ProbeRecorder)
 	if !ok {
 		ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 		defer cancel()
 		_, _ = p.URLTest(ctx, url, expectedStatus)
 		return probePassed, nil
+	}
+	if how.hold != nil {
+		how.hold.to = recorder
+		recorder = how.hold
 	}
 
 	key := probeFlightKey(p, url, expectedStatus)
@@ -679,7 +854,7 @@ func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRang
 	flight := &probeFlight{done: make(chan struct{})}
 	probeFlights.m[key] = flight
 	probeFlights.Unlock()
-	outcome, result := hc.probeOnce(p, recorder, url, expectedStatus)
+	outcome, result := hc.probeOnce(p, recorder, url, expectedStatus, how.fresh)
 	probeFlights.Lock()
 	delete(probeFlights.m, key)
 	probeFlights.Unlock()
@@ -690,13 +865,13 @@ func (hc *HealthCheck) probe(p C.Proxy, url string, expectedStatus utils.IntRang
 
 // probeOnce is the probe itself, with the hedge; probe wraps it so that one
 // node is probed once at a time whichever groups ask.
-func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16]) (probeOutcome, *C.ProbeResult) {
+func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string, expectedStatus utils.IntRanges[uint16], fresh bool) (probeOutcome, *C.ProbeResult) {
 	// The second probe guards a live node against a false verdict; a dead
 	// node has none to lose, and every live node gets it, the slow ones too.
 	alive := p.AliveForTestUrl(url)
 	keeps := keepsConns(p)
 	hedgeAt := hc.hedgeAt(recorder.LastProbeElapsed(url), keeps)
-	first := hc.startProbe(p, url, expectedStatus, nil, !alive && keeps)
+	first := hc.startProbe(p, url, expectedStatus, nil, (fresh || !alive) && keeps)
 	defer first.cancel()
 	// The hedge delay counts from the probe's own start, not from its wait
 	// for a turn to the host.

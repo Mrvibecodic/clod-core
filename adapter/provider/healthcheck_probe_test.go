@@ -313,9 +313,10 @@ func TestProbesToOneHostDoNotBurst(t *testing.T) {
 func TestPacedProbesOfAClosedPortLeaveOneFailureEach(t *testing.T) {
 	target := newProbeTarget(t, 0)
 	target.close()
+	shortRoundRetry(t)
 	// Eight nodes on one closed port: their probes and second probes wait for
-	// their turns to the host, and each node still ends the round dead with
-	// one failure in its history.
+	// their turns to the host, and each node still ends the round, retried
+	// for none of them answered, dead with one failure in its history.
 	const nodes = 8
 	proxies := make([]C.Proxy, 0, nodes)
 	for i := 0; i < nodes; i++ {
