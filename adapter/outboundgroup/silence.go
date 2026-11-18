@@ -3,6 +3,8 @@ package outboundgroup
 import (
 	"context"
 	"errors"
+	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -107,9 +109,14 @@ type watchedConn struct {
 
 	wrote   atomic.Bool
 	settled atomic.Bool
-	mu      sync.Mutex
-	timer   *time.Timer
-	sent    time.Time
+	// delivered: a request went out whole. counted: the connection was
+	// counted as one the node left unanswered, by its timer or by an error
+	// in place of the first byte; it is counted once.
+	delivered atomic.Bool
+	counted   atomic.Bool
+	mu        sync.Mutex
+	timer     *time.Timer
+	sent      time.Time
 }
 
 func (c *watchedConn) sentOnce() {
@@ -120,7 +127,7 @@ func (c *watchedConn) sentOnce() {
 	c.sent = time.Now()
 	if !c.settled.Load() {
 		c.timer = time.AfterFunc(silenceAfter, func() {
-			if !c.settled.Load() {
+			if !c.settled.Load() && c.counted.CompareAndSwap(false, true) {
 				c.gb.noteSilence(c.node, c.born, c.sent, c.ask)
 			}
 		})
@@ -147,34 +154,86 @@ func (c *watchedConn) settle(answered bool) {
 	}
 }
 
+// refused ends the watch of a connection that got an error in place of its
+// first byte back. After a request went out whole that is a connection the
+// node left unanswered, as one whose wait ran out is: a server that takes
+// connections and drops every request says so at once. An error after a
+// failed write, or after the local side let its deadline pass, says nothing
+// of the node; a connection the local side closed first is settled already.
+func (c *watchedConn) refused(err error) {
+	if !c.delivered.Load() || localEnd(err) {
+		c.settle(false)
+		return
+	}
+	if !c.settled.CompareAndSwap(false, true) {
+		return
+	}
+	c.mu.Lock()
+	if c.timer != nil {
+		c.timer.Stop()
+	}
+	sent := c.sent
+	c.mu.Unlock()
+	if c.counted.CompareAndSwap(false, true) {
+		c.gb.noteSilence(c.node, c.born, sent, c.ask)
+	}
+}
+
+// localEnd reports whether err is the local side ending the read.
+func localEnd(err error) bool {
+	var timeout interface{ Timeout() bool }
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// written follows a write: a request that went out whole is waited on, a
+// failed write ends the watch. The connection failed, and the group counts
+// that where it counts failed connections, not as silence.
+func (c *watchedConn) written(request bool, err error) {
+	if err != nil {
+		c.settle(false)
+	} else if request {
+		c.delivered.Store(true)
+	}
+}
+
 // An empty write sends no request: it only has the node open its
 // connection, for a client that is yet to say anything.
-func (c *watchedConn) Write(b []byte) (int, error) {
+func (c *watchedConn) Write(b []byte) (n int, err error) {
 	if len(b) > 0 {
 		c.sentOnce()
 	}
-	return c.Conn.Write(b)
+	n, err = c.Conn.Write(b)
+	c.written(len(b) > 0, err)
+	return
 }
 
 func (c *watchedConn) WriteBuffer(buffer *buf.Buffer) error {
-	if !buffer.IsEmpty() {
+	request := !buffer.IsEmpty()
+	if request {
 		c.sentOnce()
 	}
-	return c.Conn.WriteBuffer(buffer)
+	err := c.Conn.WriteBuffer(buffer)
+	c.written(request, err)
+	return err
 }
 
 func (c *watchedConn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
-	if n > 0 || err != nil {
-		c.settle(n > 0)
+	if n > 0 {
+		c.settle(true)
+	} else if err != nil {
+		c.refused(err)
 	}
 	return
 }
 
 func (c *watchedConn) ReadBuffer(buffer *buf.Buffer) (err error) {
 	err = c.Conn.ReadBuffer(buffer)
-	if err != nil || !buffer.IsEmpty() {
-		c.settle(!buffer.IsEmpty())
+	if !buffer.IsEmpty() {
+		c.settle(true)
+	} else if err != nil {
+		c.refused(err)
 	}
 	return
 }
@@ -199,8 +258,8 @@ func (c *watchedConn) WriterPossiblyReplaceable() bool { return !c.wrote.Load() 
 var _ N.ExtendedConn = (*watchedConn)(nil)
 
 // watch has the group notice a node that takes connections and passes no
-// data: silenceCount connections through p in a row left without a byte back
-// have the group ask about p. answered, if any, is told of the first byte
+// data: silenceCount connections through p in a row left without a byte back,
+// or cut before the first one, have the group ask about p. answered, if any, is told of the first byte
 // back: a connection that opened says little, many nodes open one without a
 // packet sent, and it is the answer that shows the node carries traffic.
 //
