@@ -88,6 +88,7 @@ func TestRetireKeepsAtMostTwoConnectionsSetAside(t *testing.T) {
 	first, second, third := &countedClient{}, &countedClient{}, &countedClient{}
 	first.streams.Store(1)
 	second.streams.Store(1)
+	third.streams.Store(1)
 	pool.tcpClients.PushFront(first)
 	if !pool.Retire() {
 		t.Fatal("the first connection was not set aside")
@@ -289,8 +290,13 @@ func TestRetireOfTwoConnectionsLeavesNoRoomForMore(t *testing.T) {
 	if !pool.Retire() {
 		t.Fatal("the two connections were not set aside")
 	}
-	pool.tcpClients.PushFront(&countedClient{})
-	pool.udpClients.PushFront(&countedClient{})
+	stream2, packets2 := &countedClient{}, &countedClient{}
+	stream2.streams.Store(1)
+	packets2.streams.Store(1)
+	defer stream2.streams.Store(0)
+	defer packets2.streams.Store(0)
+	pool.tcpClients.PushFront(stream2)
+	pool.udpClients.PushFront(packets2)
 	if pool.Retire() {
 		t.Fatal("two more connections were set aside while two still carry streams")
 	}
@@ -338,5 +344,53 @@ func TestCloseRetiredClosesTheConnectionsSetAside(t *testing.T) {
 	pool.tcpClients.PushFront(next)
 	if !pool.Retire() {
 		t.Fatal("Retire was held back by connections already closed")
+	}
+}
+
+// Stream connections without a stream do not count toward the limit: with one
+// connection set aside and still busy, a busy and an idle stream connection
+// are set aside together.
+func TestRetireDoesNotCountStreamConnectionsWithoutAStream(t *testing.T) {
+	pool := &PoolClient{}
+	first, busy, idle := &countedClient{}, &countedClient{}, &countedClient{}
+	first.streams.Store(1)
+	defer first.streams.Store(0)
+	busy.streams.Store(1)
+	defer busy.streams.Store(0)
+	pool.tcpClients.PushFront(first)
+	if !pool.Retire() {
+		t.Fatal("the first connection was not set aside")
+	}
+	pool.tcpClients.PushFront(busy)
+	pool.tcpClients.PushFront(idle)
+	if !pool.Retire() {
+		t.Fatal("an idle stream connection was counted toward the limit")
+	}
+	if pool.tcpClients.Len() != 0 {
+		t.Fatalf("%d stream connections left in the pool, want none", pool.tcpClients.Len())
+	}
+	if busy.closed.Load() {
+		t.Fatal("the busy connection was closed under its stream")
+	}
+}
+
+// An idle stream connection does not take the room of a packet connection:
+// a busy and an idle stream connection leave room for one packet connection,
+// set aside with them.
+func TestAPacketConnectionFitsBesideAnIdleStreamConnection(t *testing.T) {
+	pool := &PoolClient{}
+	busy, idle, packets := &countedClient{}, &countedClient{}, &countedClient{}
+	busy.streams.Store(1)
+	defer busy.streams.Store(0)
+	packets.streams.Store(1)
+	defer packets.streams.Store(0)
+	pool.tcpClients.PushFront(busy)
+	pool.tcpClients.PushFront(idle)
+	pool.udpClients.PushFront(packets)
+	if !pool.Retire() {
+		t.Fatal("the connections were not set aside")
+	}
+	if pool.tcpClients.Len() != 0 || pool.udpClients.Len() != 0 {
+		t.Fatalf("left in the pool: %d and %d, want 0 and 0", pool.tcpClients.Len(), pool.udpClients.Len())
 	}
 }
