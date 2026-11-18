@@ -1,8 +1,10 @@
 package outboundgroup
 
 import (
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	C "github.com/metacubex/mihomo/constant"
@@ -238,3 +240,112 @@ func TestANodeThatAnswersAtItsSecondTryIsWrittenNothing(t *testing.T) {
 		t.Fatal("no pause after a node found alive")
 	}
 }
+
+// refusedConns opens n watched connections through node, each of which sends
+// its request; they are cut by the far side when cut is called.
+func refusedConns(t *testing.T, gb *GroupBase, node C.Proxy, asks *askCounter, n int) (cut func(), conns []C.Conn) {
+	t.Helper()
+	var fars []func()
+	for i := 0; i < n; i++ {
+		conn, far := watchedPair(t, gb, node, asks)
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		conns, fars = append(conns, conn), append(fars, func() { _ = far.Close() })
+	}
+	return func() {
+		for _, f := range fars {
+			f()
+		}
+	}, conns
+}
+
+func readAll(conns []C.Conn) {
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(conn C.Conn) {
+			defer wg.Done()
+			_, _ = conn.Read(make([]byte, 16))
+		}(conn)
+	}
+	wg.Wait()
+}
+
+// A connection that got an error in place of its first byte is one the node
+// left unanswered: a server that takes connections and drops every request
+// is noticed at once, not when the scheduled check comes.
+func TestAConnectionCutBeforeItsFirstByteCountsAsSilence(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	cut, conns := refusedConns(t, gb, node, asks, silenceCount)
+	cut()
+	readAll(conns)
+	asks.want(t, 1)
+}
+
+// A connection cut before its first byte is counted once: its timer, when it
+// runs out, does not count it again.
+func TestACutConnectionIsNotCountedAgainByItsTimer(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	cut, conns := refusedConns(t, gb, node, asks, silenceCount-1)
+	cut()
+	readAll(conns)
+	time.Sleep(silenceAfter + 200*time.Millisecond)
+	asks.want(t, 0)
+}
+
+// A connection whose wait ran out is counted by its timer, and the error that
+// ends it later does not count it again.
+func TestAConnectionCutAfterItsWaitIsNotCountedTwice(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	cut, conns := refusedConns(t, gb, node, asks, silenceCount-1)
+	time.Sleep(silenceAfter + 200*time.Millisecond)
+	cut()
+	readAll(conns)
+	asks.want(t, 0)
+}
+
+// A connection the local side closed, or whose read deadline it let pass,
+// was given up by the app: the error that ends its read counts nothing.
+func TestAConnectionTheLocalSideEndedCountsNothing(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	_, closed := refusedConns(t, gb, node, asks, silenceCount)
+	for _, conn := range closed {
+		_ = conn.Close()
+	}
+	readAll(closed)
+	_, late := refusedConns(t, gb, node, asks, silenceCount)
+	for _, conn := range late {
+		_ = conn.SetReadDeadline(time.Now())
+	}
+	readAll(late)
+	for _, conn := range late {
+		_ = conn.Close()
+	}
+	time.Sleep(silenceAfter + 200*time.Millisecond)
+	asks.want(t, 0)
+}
+
+// A write that fails ends the watch: the connection failed, it was not left
+// unanswered, and the read that fails after it counts nothing either.
+func TestAFailedWriteCountsNoSilence(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	for i := 0; i < silenceCount; i++ {
+		conn := &watchedConn{Conn: failingConn{}, gb: gb, node: node, born: time.Now(), ask: asks.ask}
+		if _, err := conn.Write([]byte("ping")); err == nil {
+			t.Fatal("the write did not fail")
+		}
+		_, _ = conn.Read(make([]byte, 16))
+	}
+	time.Sleep(silenceAfter + 200*time.Millisecond)
+	asks.want(t, 0)
+}
+
+// failingConn fails every write and read, as a connection whose handshake
+// failed does.
+type failingConn struct{ C.Conn }
+
+var errHandshake = errors.New("handshake failed")
+
+func (failingConn) Write([]byte) (int, error) { return 0, errHandshake }
+func (failingConn) Read([]byte) (int, error)  { return 0, errHandshake }
