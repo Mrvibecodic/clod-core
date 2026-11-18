@@ -85,6 +85,14 @@ func (gb *GroupBase) recheckEvery(p C.Proxy, d doubt, pauses []time.Duration, co
 	}()
 }
 
+// probeBudget is how long a check of the group gives a probe of ProbeNode at
+// timeout: its first try may wait up to ProbeReserve for its turn to the
+// host, and a second try started after that still has a whole timeout of its
+// own before the end of the probe, which takes ProbeReserve more.
+func probeBudget(timeout time.Duration) time.Duration {
+	return provider.ProbeHedgeDelay + timeout + 2*C.ProbeReserve
+}
+
 // recheckTurn probes p unless someone else has, since seen, and recently
 // enough for the series to take their answer. It returns when p was last
 // probed.
@@ -92,7 +100,7 @@ func (gb *GroupBase) recheckTurn(p C.Proxy, d doubt, seen time.Time) time.Time {
 	if last := lastProbe(p, d.url); last.Equal(seen) || time.Since(last) >= recheckFresh {
 		timeout := time.Duration(gb.testTimeout) * time.Millisecond
 		expected, _ := utils.NewUnsignedRanges[uint16](d.expected)
-		ctx, cancel := context.WithTimeout(context.Background(), provider.ProbeHedgeDelay+timeout+C.ProbeReserve)
+		ctx, cancel := context.WithTimeout(context.Background(), probeBudget(timeout))
 		_, _ = provider.ProbeNode(ctx, p, d.url, expected, timeout)
 		cancel()
 	}
