@@ -41,6 +41,9 @@ func measuredGroup(t *testing.T, proxies []C.Proxy) (*URLTest, *measuredProvider
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A node the group leaves dead has a series that wakes up seconds later
+	// and reads the provider, which the test changes without a lock.
+	endSeries(t, group.GroupBase)
 	return group, provider
 }
 

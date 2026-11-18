@@ -50,6 +50,10 @@ type GroupBase struct {
 	failedDeadMux   sync.Mutex
 	failedDeadNext  time.Time
 	failedDeadPause time.Duration
+	// recheckOf is the node the group's series of probes follows, nil when
+	// none runs; see recheck.
+	recheckMux sync.Mutex
+	recheckOf  C.Proxy
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex
