@@ -166,10 +166,19 @@ func (u *URLTest) release(p C.Proxy) {
 	u.fastSingle.Reset()
 }
 
+// chooseAgain gives p, a node that answers again, back to the choice and
+// makes the choice now: a choice is kept for ten seconds, and the group would
+// show and use the node it is on until the next connection after that. The
+// hold of another node stays, as release leaves it.
+func (u *URLTest) chooseAgain(p C.Proxy) {
+	u.release(p)
+	u.fast(false)
+}
+
 // doubt is how the group asks about p.
 func (u *URLTest) doubt(p C.Proxy) doubt {
 	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck,
-		hold: func() { u.holdSpeed(p) }, again: func() { u.release(p) }}
+		hold: func() { u.holdSpeed(p) }, again: func() { u.chooseAgain(p) }}
 }
 
 // checkAfter is the check the failed connections through p ask for.
@@ -295,10 +304,19 @@ func (u *URLTest) pick(touch bool) (C.Proxy, bool) {
 			u.fastNode = current
 		}
 
+		// A node on probation is no candidate unless the group is on it
+		// already or no other node is alive.
+		probation := u.onProbation()
+		if probation == u.fastNode || len(aliveBut(proxies, probation, u.testUrl)) == 0 {
+			probation = nil
+		}
 		fast := proxies[0]
+		if fast == probation {
+			fast = proxies[1]
+		}
 		minScore := u.score(fast)
 		for _, proxy := range proxies {
-			if !proxy.AliveForTestUrl(u.testUrl) {
+			if proxy == probation || !proxy.AliveForTestUrl(u.testUrl) {
 				continue
 			}
 

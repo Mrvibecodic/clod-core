@@ -55,6 +55,10 @@ type GroupBase struct {
 	// none runs; see recheck.
 	recheckMux sync.Mutex
 	recheckOf  C.Proxy
+	// probation is the node the series probationOf found alive and makes
+	// its control probes of; see onProbation.
+	probation   C.Proxy
+	probationOf int32
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex
