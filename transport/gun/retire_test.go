@@ -435,3 +435,37 @@ func TestRetireOfAPoolWhereOnlyOneConnectionCarriesAStreamSetsItAllAside(t *test
 	_ = held[0].Close()
 	waitFor(t, "the connection set aside stayed open after its last stream", func() bool { return conns.at(0).closed.Load() })
 }
+
+// setAside reports how many connections count as set aside for the client.
+func setAside(c *Client) int {
+	retiredMu.Lock()
+	defer retiredMu.Unlock()
+	return len(retired[c])
+}
+
+// A connection set aside under a stream that goes on closes with its client,
+// and nothing counts as set aside any more.
+func TestCloseClosesTheConnectionsSetAside(t *testing.T) {
+	addr, streams := serveStreams(t)
+	var conns dialedConns
+	client := newWatchedClient(addr, 0, &conns)
+
+	conn, err := client.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitFor(t, "the stream did not reach the server", func() bool { return streams.Load() == 1 })
+	if !client.Retire() {
+		t.Fatal("the connection in use was not set aside")
+	}
+	if n := setAside(client); n != 1 {
+		t.Fatalf("%d connections count as set aside, want 1", n)
+	}
+
+	_ = client.Close()
+	waitFor(t, "the connection set aside outlived its client", func() bool { return conns.at(0).closed.Load() })
+	if n := setAside(client); n != 0 {
+		t.Fatalf("%d connections count as set aside after Close, want none", n)
+	}
+}

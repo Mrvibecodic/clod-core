@@ -420,6 +420,7 @@ func (c *Client) Dial() (net.Conn, error) {
 }
 
 func (c *Client) Close() error {
+	defer c.CloseRetired() // after the current ones: one set aside meanwhile is closed too
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	var errs []error

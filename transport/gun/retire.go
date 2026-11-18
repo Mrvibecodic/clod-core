@@ -15,10 +15,10 @@ var retireStep = time.Second
 
 var (
 	retiredMu sync.Mutex
-	// retired counts the connections each client has set aside and not yet
-	// closed. A client is dropped from it at zero, so it does not keep the
-	// client alive.
-	retired = map[*Client]int{}
+	// retired holds the connections each client has set aside and not yet
+	// closed: their number is what counts toward retireLimit. A client is
+	// dropped from it at zero, so it does not keep the client alive.
+	retired = map[*Client]map[*Transport]struct{}{}
 )
 
 // Retire has the next streams open over new connections and reports whether
@@ -42,27 +42,51 @@ func (c *Client) Retire() bool {
 			busy++
 		}
 	}
-	if len(old) == 0 || (retired[c] > 0 && retired[c]+busy > retireLimit) {
+	if n := len(retired[c]); len(old) == 0 || (n > 0 && n+busy > retireLimit) {
 		c.mutex.Unlock()
 		retiredMu.Unlock()
 		return false
 	}
 	c.transports = nil
 	c.mutex.Unlock()
-	retired[c] += len(old)
+	set := retired[c]
+	if set == nil {
+		set = map[*Transport]struct{}{}
+		retired[c] = set
+	}
+	for _, t := range old {
+		set[t] = struct{}{}
+	}
 	retiredMu.Unlock()
 	step := retireStep
 	for _, t := range old {
 		go func(t *Transport) {
 			t.closeWhenIdle(step)
 			retiredMu.Lock()
-			if retired[c]--; retired[c] <= 0 {
-				delete(retired, c)
+			// Gone already when CloseRetired closed it.
+			if set := retired[c]; set != nil {
+				delete(set, t)
+				if len(set) == 0 {
+					delete(retired, c)
+				}
 			}
 			retiredMu.Unlock()
 		}(t)
 	}
 	return true
+}
+
+// CloseRetired closes the connections the client has set aside, whatever
+// streams they still carry, and leaves none counted. They are no longer the
+// client's to hand out, so closing the client alone would leave them open.
+func (c *Client) CloseRetired() {
+	retiredMu.Lock()
+	set := retired[c]
+	delete(retired, c)
+	retiredMu.Unlock()
+	for t := range set {
+		_ = t.Close()
+	}
 }
 
 // closeWhenIdle looks at the streams once a step and closes the connection
