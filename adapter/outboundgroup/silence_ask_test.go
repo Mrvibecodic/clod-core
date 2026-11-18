@@ -111,8 +111,9 @@ func quiet(gb *GroupBase) bool {
 	return time.Now().Before(gb.silence.quietUntil)
 }
 
-// A silent node beside one that answers is dead: both answers are written
-// down, and the rest of the group is not checked.
+// A silent node beside one that answers at its first try is dead: its answer
+// is written down, the witness's is not, and the rest of the group is not
+// checked.
 func TestASilentNodeBesideAnAnsweringOneIsMarkedDead(t *testing.T) {
 	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
 	gb, provider, d := askedGroup(a, b)
@@ -120,7 +121,7 @@ func TestASilentNodeBesideAnAnsweringOneIsMarkedDead(t *testing.T) {
 	if !a.dead.Load() || a.records() != 1 {
 		t.Fatalf("the silent node: dead %v, records %d", a.dead.Load(), a.records())
 	}
-	if b.dead.Load() || b.records() != 1 {
+	if b.dead.Load() || b.records() != 0 {
 		t.Fatalf("the answering node: dead %v, records %d", b.dead.Load(), b.records())
 	}
 	if provider.checks.Load() != 0 {
@@ -201,7 +202,8 @@ func TestWitnessesAreTheFirstFewTheGroupWouldGoTo(t *testing.T) {
 
 // Nodes on the server of the node in doubt go down with it and say little of
 // the network: when the first few are all there, the last of them gives its
-// place to the best node of another server.
+// place to the best node of another server. Two of the first silent is no
+// proof yet: the second look adds a node of a server not asked (G).
 func TestOneWitnessIsOfAnotherServer(t *testing.T) {
 	nodes := []*askedProxy{askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.1", false), askedNode("C", "192.0.2.1", false), askedNode("D", "192.0.2.1", false), askedNode("E", "192.0.2.1", false), askedNode("F", "192.0.2.2", true), askedNode("G", "192.0.2.3", true)}
 	gb, provider, d := askedGroup(nodes...)
@@ -212,8 +214,8 @@ func TestOneWitnessIsOfAnotherServer(t *testing.T) {
 			asked += n.name
 		}
 	}
-	if asked != "BCF" {
-		t.Fatalf("asked beside the node: %q, want BCF", asked)
+	if asked != "BCFG" {
+		t.Fatalf("asked beside the node: %q, want BCFG", asked)
 	}
 	if !nodes[0].dead.Load() || !nodes[1].dead.Load() || !nodes[2].dead.Load() || nodes[5].dead.Load() {
 		t.Fatal("the server that is down was not told from the one that answers")
@@ -468,14 +470,15 @@ func asked(nodes []*askedProxy) string {
 
 // Nodes of one kind stop together: when the first the group would go to are
 // all of the kind of the node in doubt, one of them gives its place to the
-// best node of another kind.
+// best node of another kind. Two of the first silent is no proof yet: the
+// second look adds the servers not asked (D, E).
 func TestOneWitnessIsOfAnotherKind(t *testing.T) {
 	nodes := []*askedProxy{askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", false), askedNode("C", "192.0.2.3", false), askedNode("D", "192.0.2.4", false), askedNode("E", "192.0.2.5", false), askedNode("F", "192.0.2.6", true)}
 	nodes[5].trojan = true
 	gb, provider, d := askedGroup(nodes...)
 	gb.askOf(nodes[0], d, false)
-	if got := asked(nodes[1:]); got != "BCF" {
-		t.Fatalf("asked beside the node: %q, want BCF", got)
+	if got := asked(nodes[1:]); got != "BCDEF" {
+		t.Fatalf("asked beside the node: %q, want BCDEF", got)
 	}
 	if !nodes[0].dead.Load() || nodes[5].dead.Load() || provider.checks.Load() != 0 {
 		t.Fatal("the kind that stopped was not told from the one that works")
@@ -505,7 +508,7 @@ func TestSilentWitnessesHaveMoreNodesAsked(t *testing.T) {
 	if !nodes[0].dead.Load() || !nodes[1].dead.Load() || !nodes[3].dead.Load() || !nodes[9].dead.Load() || nodes[6].dead.Load() {
 		t.Fatal("the silent nodes were not told from the one that answers")
 	}
-	if nodes[6].records() != 1 || provider.checks.Load() != 0 {
+	if nodes[6].records() != 0 || provider.checks.Load() != 0 {
 		t.Fatalf("the answer was written %d times, the whole group checked %d times", nodes[6].records(), provider.checks.Load())
 	}
 	if gb.rechecks.Load() != 1 {
