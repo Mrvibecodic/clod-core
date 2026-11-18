@@ -38,9 +38,15 @@ type URLTest struct {
 	// hiddenGeneration — набор скрытых узлов, при котором сделан выбор:
 	// сменился — выбор делается заново, а не берётся из кеша.
 	hiddenGeneration stdatomic.Uint64
-	// held is when a check asked for by a doubt of the group's node left the
-	// node alive, zero when its delay has been measured since.
-	held atomic.TypedValue[time.Time]
+	// held is the node a check asked for by a doubt of it left alive, and
+	// when; nil when its delay has been measured since.
+	held atomic.TypedValue[*hold]
+}
+
+// hold is a node kept whatever delays a check has left, and when it was.
+type hold struct {
+	node C.Proxy
+	at   time.Time
 }
 
 func (u *URLTest) Now() string {
@@ -113,7 +119,7 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 		if dead {
 			answered = func() { u.onDeadNodeDialed(proxy, u.testUrl, u.healthCheck) }
 		}
-		c = u.watch(c, proxy, born, u.doubt(), answered)
+		c = u.watch(c, proxy, born, u.doubt(proxy), answered)
 	}
 
 	return c, err
@@ -138,42 +144,48 @@ func (u *URLTest) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	return u.fast(touch)
 }
 
-// holdSpeed keeps the group on its node whatever delays the check just made
-// has left: a check asked for by failed or unanswered connections measures
-// the node when it is at its worst, it tells alive from dead and no more.
-func (u *URLTest) holdSpeed() {
-	u.held.Store(time.Now())
+// holdSpeed keeps the group on p whatever delays the check just made has
+// left: a check asked for by failed or unanswered connections measures the
+// node when it is at its worst, it tells alive from dead and no more.
+func (u *URLTest) holdSpeed(p C.Proxy) {
+	u.held.Store(&hold{node: p, at: time.Now()})
 	u.fastSingle.Reset()
 }
 
 // speedHeld reports whether the delay of the group's node is the one such a
-// check left. The next probe of the node ends it.
+// check left. The next probe of the node ends it; a hold of another node
+// keeps nothing.
 func (u *URLTest) speedHeld() bool {
 	held := u.held.Load()
-	if held.IsZero() {
+	if held == nil || held.node != u.fastNode {
 		return false
 	}
-	if lastProbe(u.fastNode, u.testUrl).After(held) {
+	if lastProbe(u.fastNode, u.testUrl).After(held.at) {
 		// A hold set meanwhile is another one and stays.
-		u.held.CompareAndSwap(held, time.Time{})
+		u.held.CompareAndSwap(held, nil)
 		return false
 	}
 	return true
 }
 
-// release gives a node that answers again back to the choice.
-func (u *URLTest) release() {
-	u.held.Store(time.Time{})
+// release gives p, a node that answers again, back to the choice. The hold
+// of another node stays: it is ended by that node's own probe.
+func (u *URLTest) release(p C.Proxy) {
+	if held := u.held.Load(); held != nil && held.node == p {
+		u.held.CompareAndSwap(held, nil)
+	}
 	u.fastSingle.Reset()
 }
 
-func (u *URLTest) doubt() doubt {
-	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck, hold: u.holdSpeed, again: u.release}
+// doubt is how the group asks about p.
+func (u *URLTest) doubt(p C.Proxy) doubt {
+	return doubt{url: u.testUrl, expected: u.expectedStatus, next: u.nextNodes, all: u.healthCheck,
+		hold: func() { u.holdSpeed(p) }, again: func() { u.release(p) }}
 }
 
 // checkAfter is the check the failed connections through p ask for.
 func (u *URLTest) checkAfter(p C.Proxy, born time.Time) func() {
-	return func() { u.failedOf(p, born, u.doubt()) }
+	return func() { u.failedOf(p, born, u.doubt(p)) }
 }
 
 // nextNodes is the alive nodes of the group without the given one, the best

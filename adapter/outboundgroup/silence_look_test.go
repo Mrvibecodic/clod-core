@@ -349,3 +349,24 @@ var errHandshake = errors.New("handshake failed")
 
 func (failingConn) Write([]byte) (int, error) { return 0, errHandshake }
 func (failingConn) Read([]byte) (int, error)  { return 0, errHandshake }
+
+// A node the group left that answers again ends no hold but its own: the
+// hold of the node the group is on stays until that node is probed.
+func TestAnOlderNodeGivenBackLeavesTheHoldOfTheNodeOfNow(t *testing.T) {
+	a := &measuredProxy{name: "A", delay: 300, alive: true}
+	b := &measuredProxy{name: "B", delay: 320, alive: true}
+	old := &measuredProxy{name: "O", delay: 400, alive: true}
+	group, _ := measuredGroup(t, []C.Proxy{a, b, old})
+	group.fast(false)
+	d := group.doubt(a)
+	d.hold()
+	b.delay = 50
+	group.doubt(old).again()
+	if got := group.fast(false); got != C.Proxy(a) {
+		t.Fatalf("chosen %s after another node was given back, want A held", got.Name())
+	}
+	d.again()
+	if got := group.fast(false); got != C.Proxy(b) {
+		t.Fatalf("chosen %s after A was given back, want B", got.Name())
+	}
+}
