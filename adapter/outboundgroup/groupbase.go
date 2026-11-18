@@ -54,9 +54,11 @@ type GroupBase struct {
 	failedDeadNext  time.Time
 	failedDeadPause time.Duration
 	// recheckOf is the node the group's series of probes follows, nil when
-	// none runs; see recheck.
-	recheckMux sync.Mutex
-	recheckOf  C.Proxy
+	// none runs, recheckRestarts how many times in a row its series started
+	// over; see recheck.
+	recheckMux      sync.Mutex
+	recheckOf       C.Proxy
+	recheckRestarts int
 	// probation is the node the series probationOf found alive and makes
 	// its control probes of; see onProbation.
 	probation   C.Proxy
