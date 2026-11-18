@@ -844,3 +844,42 @@ func TestAScheduledProbeKeepsItsTimeoutAfterTheWaitForItsTurn(t *testing.T) {
 		t.Fatalf("the node answered its first probe within the timeout, outcome %d", outcome)
 	}
 }
+
+// Probes asked out of schedule at once, a node and its witnesses of one
+// host, take their turns to the host like the scheduled ones: at a timeout of
+// ProbeReserve or less the wait was cut to nothing and the handshakes went out
+// together. The wait comes out of the reserve the callers budget, not out of
+// the probe's timeout.
+func TestProbesAskedTogetherAtAShortTimeoutTakeTheirTurns(t *testing.T) {
+	const timeout = 2 * time.Second
+	const nodes = 4
+	// Every node answers late in its timeout: a wait taken out of the
+	// timeout would leave the last one too little.
+	target := newProbeTarget(t, timeout-500*time.Millisecond, "slow", "slow", "slow", "slow")
+	proxies := nodesOnOneHost(t, target, nodes)
+	errs := make([]error, nodes)
+	var wg sync.WaitGroup
+	for i, p := range proxies {
+		wg.Add(1)
+		go func(i int, p C.Proxy) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), ProbeHedgeDelay+timeout+C.ProbeReserve)
+			defer cancel()
+			_, errs[i] = ProbeNode(ctx, p, target.url(), nil, timeout)
+		}(i, p)
+	}
+	wg.Wait()
+	target.mu.Lock()
+	first := append([]time.Time(nil), target.at[:nodes]...)
+	target.mu.Unlock()
+	for i := 1; i < nodes; i++ {
+		if gap := first[i].Sub(first[i-1]); gap < C.ProbeSpacing-50*time.Millisecond {
+			t.Fatalf("two probes to one host came %s apart, the spacing is %s", gap, C.ProbeSpacing)
+		}
+	}
+	for i, err := range errs {
+		if err != nil || !proxies[i].AliveForTestUrl(target.url()) {
+			t.Fatalf("%s answered within its timeout: %v", proxies[i].Name(), err)
+		}
+	}
+}

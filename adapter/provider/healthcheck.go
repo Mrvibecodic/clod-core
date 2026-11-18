@@ -501,13 +501,14 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 		base = C.UnmarkProbePaced(base)
 	}
 	run := &probeRun{result: &C.ProbeResult{}, done: make(chan struct{}), cancel: cancel}
-	// turn waits for the probe's turn to the host. A caller's deadline bounds
-	// the whole probe: the wait comes out of the probe's own time and is cut
-	// short to leave it ProbeReserve. A check without one, the scheduled
-	// check, waits for the turn in full and the probe's time starts after it:
-	// cut short, the probes that did not fit went out together, all of them
-	// at a timeout of ProbeReserve or less, and a slow node of a busy host
-	// was left too little of its timeout to answer.
+	// turn waits for the probe's turn to the host, and the probe's time
+	// starts after it. A check without a deadline, the scheduled check, waits
+	// for the turn in full: cut short, the probes that did not fit went out
+	// together. A caller's deadline bounds the whole probe: the wait takes up
+	// to ProbeReserve, which callers budget for it, and leaves the hedge
+	// delay, a timeout and the margin. Taken out of the probe's own time, as
+	// it was, it was cut to nothing at a timeout of ProbeReserve or less, and
+	// a node asked about with its witnesses on one host sent them all at once.
 	until, bounded := hc.ctx.Deadline()
 	turn := func() error {
 		if hedge {
@@ -525,26 +526,20 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 			}
 			return nil
 		}
-		ctx := base
+		limit := time.Duration(-1)
 		if bounded {
-			limit := deadline
-			// The wait of the first probe leaves the caller the hedge delay,
-			// a timeout and the grace, or a second probe failing at the
-			// deadline would be taken for a cancel.
-			if latest := until.Add(C.ProbeReserve - probeHedgeDelay - hc.timeout - probeHedgeGrace); latest.Before(limit) {
+			limit = C.ProbeReserve
+			if latest := time.Until(until) - probeHedgeDelay - hc.timeout - probeEndMargin; latest < limit {
 				limit = latest
 			}
-			var stop context.CancelFunc
-			ctx, stop = context.WithDeadline(base, limit)
-			defer stop()
+			if limit < 0 {
+				limit = 0
+			}
 		}
-		asked := time.Now()
-		if err := C.ProbePace(ctx, C.ProbeHostOf(p)); err != nil {
+		if err := C.ProbePaceWithin(base, C.ProbeHostOf(p), limit); err != nil {
 			return err
 		}
-		if !bounded {
-			deadline = deadline.Add(time.Since(asked))
-		}
+		deadline = time.Now().Add(hc.timeout)
 		return nil
 	}
 	if !hedge && turn() != nil {
