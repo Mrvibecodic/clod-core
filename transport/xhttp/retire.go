@@ -15,10 +15,11 @@ var retireStep = time.Second
 
 var (
 	retiredMu sync.Mutex
-	// retired counts the connections each client (or each pool retired on
-	// its own) has set aside and not yet closed. One is dropped from it at
-	// zero, so it does not keep the client alive.
-	retired = map[any]int{}
+	// retired holds the connections each client (or each pool retired on its
+	// own) has set aside and not yet closed: their number is what counts
+	// toward retireLimit. One is dropped from it at zero, so it does not keep
+	// the client alive.
+	retired = map[any]map[*reuseEntry]struct{}{}
 )
 
 // Retire has the next sessions open over new connections and reports whether
@@ -68,7 +69,7 @@ func retire(owner any, closed <-chan struct{}, pools ...*ReuseManager) bool {
 			}
 		}
 	}
-	if len(old) == 0 || (retired[owner] > 0 && retired[owner]+busy > retireLimit) {
+	if n := len(retired[owner]); len(old) == 0 || (n > 0 && n+busy > retireLimit) {
 		return false
 	}
 	for _, m := range pools {
@@ -76,39 +77,66 @@ func retire(owner any, closed <-chan struct{}, pools ...*ReuseManager) bool {
 			m.entries = make([]*reuseEntry, 0)
 		}
 	}
-	retired[owner] += len(old)
+	set := retired[owner]
+	if set == nil {
+		set = map[*reuseEntry]struct{}{}
+		retired[owner] = set
+	}
+	for _, entry := range old {
+		set[entry] = struct{}{}
+	}
 	go closeWhenIdle(owner, old, retireStep, closed)
 	return true
 }
 
-// release takes n connections set aside off the count once they are closed.
-func release(owner any, n int) {
-	if n == 0 {
+// release takes connections set aside off the count once they are closed.
+// One CloseRetired took off already is not there any more.
+func release(owner any, entries []*reuseEntry) {
+	if len(entries) == 0 {
 		return
 	}
 	retiredMu.Lock()
-	if retired[owner] -= n; retired[owner] <= 0 {
-		delete(retired, owner)
+	if set := retired[owner]; set != nil {
+		for _, entry := range entries {
+			delete(set, entry)
+		}
+		if len(set) == 0 {
+			delete(retired, owner)
+		}
 	}
 	retiredMu.Unlock()
+}
+
+// closeRetired closes the connections set aside under key, whatever sessions
+// they still carry, and leaves none counted.
+func closeRetired(key any) {
+	retiredMu.Lock()
+	set := retired[key]
+	delete(retired, key)
+	retiredMu.Unlock()
+	for entry := range set {
+		entry.close()
+	}
 }
 
 func closeWhenIdle(owner any, entries []*reuseEntry, step time.Duration, closed <-chan struct{}) {
 	tick := time.NewTicker(step)
 	defer tick.Stop()
 	for {
-		kept := entries[:0]
+		var gone, kept []*reuseEntry
 		for _, entry := range entries {
 			if entry.isClosed() {
+				gone = append(gone, entry)
 				continue
 			}
 			if entry.openUsage.Load() == 0 {
 				entry.close()
+				gone = append(gone, entry)
 				continue
 			}
 			kept = append(kept, entry)
 		}
-		release(owner, len(entries)-len(kept))
+		release(owner, gone)
 		if entries = kept; len(entries) == 0 {
 			return
 		}
@@ -118,7 +146,7 @@ func closeWhenIdle(owner any, entries []*reuseEntry, step time.Duration, closed 
 			for _, entry := range entries {
 				entry.close()
 			}
-			release(owner, len(entries))
+			release(owner, entries)
 			return
 		}
 	}
@@ -130,6 +158,13 @@ func closeWhenIdle(owner any, entries []*reuseEntry, step time.Duration, closed 
 // none.
 func (c *Client) Retire() bool {
 	return retire(c, c.ctx.Done(), c.uploadManager, c.downloadManager)
+}
+
+// CloseRetired closes the connections the client has set aside, whatever
+// sessions they still carry, and leaves none counted. Closing the client does
+// it as well; this is for when the client goes on.
+func (c *Client) CloseRetired() {
+	closeRetired(c)
 }
 
 // Pooled reports whether the client keeps a pool of connections for its

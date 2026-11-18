@@ -22,10 +22,10 @@ var retireStep = time.Second
 
 var (
 	retiredMu sync.Mutex
-	// retired counts the connections each pool has set aside and not yet
-	// closed. A pool is dropped from it at zero, so it does not keep the pool
-	// alive.
-	retired = map[*PoolClient]int{}
+	// retired holds the connections each pool has set aside and not yet
+	// closed: their number is what counts toward retireLimit. A pool is
+	// dropped from it at zero, so it does not keep the pool alive.
+	retired = map[*PoolClient]map[Client]struct{}{}
 )
 
 // Retire has the next streams and packet sessions open over new connections
@@ -60,7 +60,8 @@ func (t *PoolClient) Retire() bool {
 		return found
 	}
 	tcp, udp := collect(&t.tcpClients), collect(&t.udpClients)
-	if retired[t] > 0 && retired[t]+len(tcp) > retireLimit {
+	n := len(retired[t])
+	if n > 0 && n+len(tcp) > retireLimit {
 		return false
 	}
 	var old []Client
@@ -68,26 +69,51 @@ func (t *PoolClient) Retire() bool {
 		t.tcpClients.Init()
 		old = append(old, tcp...)
 	}
-	if len(udp) > 0 && retired[t]+len(tcp)+len(udp) <= retireLimit {
+	if len(udp) > 0 && n+len(tcp)+len(udp) <= retireLimit {
 		t.udpClients.Init()
 		old = append(old, udp...)
 	}
 	if len(old) == 0 {
 		return false
 	}
-	retired[t] += len(old)
-	go closeWhenIdle(old, retireStep, retireGrace, func() {
+	set := retired[t]
+	if set == nil {
+		set = map[Client]struct{}{}
+		retired[t] = set
+	}
+	for _, client := range old {
+		set[client] = struct{}{}
+	}
+	go closeWhenIdle(old, retireStep, retireGrace, func(client Client) {
 		retiredMu.Lock()
-		if retired[t]--; retired[t] <= 0 {
-			delete(retired, t)
+		// Gone already when CloseRetired closed it.
+		if set := retired[t]; set != nil {
+			delete(set, client)
+			if len(set) == 0 {
+				delete(retired, t)
+			}
 		}
 		retiredMu.Unlock()
 	})
 	return true
 }
 
+// CloseRetired closes the connections the pool has set aside and leaves none
+// counted: each is closed as one in the pool is, so it goes once nothing runs
+// over it any more instead of waiting out retireGrace. They are no longer the
+// pool's to hand out, so whatever closes the pool's own leaves them open.
+func (t *PoolClient) CloseRetired() {
+	retiredMu.Lock()
+	set := retired[t]
+	delete(retired, t)
+	retiredMu.Unlock()
+	for client := range set {
+		client.Close()
+	}
+}
+
 // closeWhenIdle calls closed for each connection it closes.
-func closeWhenIdle(clients []Client, step, grace time.Duration, closed func()) {
+func closeWhenIdle(clients []Client, step, grace time.Duration, closed func(Client)) {
 	for len(clients) > 0 {
 		time.Sleep(step)
 		kept := clients[:0]
@@ -96,7 +122,7 @@ func closeWhenIdle(clients []Client, step, grace time.Duration, closed func()) {
 				// Closing waits for a handshake in progress: not in the way
 				// of the others.
 				go client.Close()
-				closed()
+				closed(client)
 				continue
 			}
 			kept = append(kept, client)

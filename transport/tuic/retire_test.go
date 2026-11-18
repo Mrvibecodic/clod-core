@@ -61,7 +61,7 @@ func TestAConnectionSetAsideClosesWhenItCarriesNothing(t *testing.T) {
 	busy, taken, idle := &countedClient{}, &countedClient{}, &countedClient{}
 	busy.streams.Store(1)
 	taken.SetLastVisited(time.Now())
-	go closeWhenIdle([]Client{busy, taken, idle}, 10*time.Millisecond, 200*time.Millisecond, func() {})
+	go closeWhenIdle([]Client{busy, taken, idle}, 10*time.Millisecond, 200*time.Millisecond, func(Client) {})
 	if !closedSoon(idle) {
 		t.Fatal("the idle connection stayed open")
 	}
@@ -246,7 +246,7 @@ func TestRetireOfTheNextStreamConnectionIsNotBlockedByALongPacketConnection(t *t
 	deadline := time.Now().Add(time.Second)
 	for {
 		retiredMu.Lock()
-		n := retired[pool]
+		n := len(retired[pool])
 		retiredMu.Unlock()
 		if n == 1 {
 			break
@@ -296,5 +296,47 @@ func TestRetireOfTwoConnectionsLeavesNoRoomForMore(t *testing.T) {
 	}
 	if pool.tcpClients.Len() != 1 || pool.udpClients.Len() != 1 {
 		t.Fatalf("left in the pool: %d and %d, want 1 and 1", pool.tcpClients.Len(), pool.udpClients.Len())
+	}
+}
+
+// setAside reports how many connections count as set aside for the pool.
+func setAside(pool *PoolClient) int {
+	retiredMu.Lock()
+	defer retiredMu.Unlock()
+	return len(retired[pool])
+}
+
+// CloseRetired closes the connections set aside, the busy ones too, and
+// leaves none counted: the next Retire is not held back by them.
+func TestCloseRetiredClosesTheConnectionsSetAside(t *testing.T) {
+	pool := &PoolClient{}
+	first, second := &countedClient{}, &countedClient{}
+	first.streams.Store(1)
+	second.streams.Store(1)
+	defer first.streams.Store(0)
+	defer second.streams.Store(0)
+	pool.tcpClients.PushFront(first)
+	pool.udpClients.PushFront(second)
+	if !pool.Retire() {
+		t.Fatal("the connections were not set aside")
+	}
+	if n := setAside(pool); n != 2 {
+		t.Fatalf("%d connections count as set aside, want 2", n)
+	}
+
+	pool.CloseRetired()
+	if !first.closed.Load() || !second.closed.Load() {
+		t.Fatalf("closed: the stream connection %v, the packet one %v", first.closed.Load(), second.closed.Load())
+	}
+	if n := setAside(pool); n != 0 {
+		t.Fatalf("%d connections count as set aside after CloseRetired, want none", n)
+	}
+
+	next := &countedClient{}
+	next.streams.Store(1)
+	defer next.streams.Store(0)
+	pool.tcpClients.PushFront(next)
+	if !pool.Retire() {
+		t.Fatal("Retire was held back by connections already closed")
 	}
 }

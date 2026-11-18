@@ -238,7 +238,7 @@ func TestRetireCountsUploadAndDownloadConnectionsTogether(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		retiredMu.Lock()
-		n := retired[client]
+		n := len(retired[client])
 		retiredMu.Unlock()
 		if n == 1 {
 			break
@@ -356,5 +356,45 @@ func TestRetireOfAPoolWhereOnlyOneConnectionCarriesASessionSetsItAllAside(t *tes
 			t.Fatal("the connection set aside stayed open after its last session")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// setAside reports how many connections count as set aside under key.
+func setAside(key any) int {
+	retiredMu.Lock()
+	defer retiredMu.Unlock()
+	return len(retired[key])
+}
+
+// CloseRetired closes the connections set aside, whatever sessions they still
+// carry, and leaves none counted, while the client and its pools go on.
+func TestCloseRetiredClosesTheConnectionsSetAside(t *testing.T) {
+	var created atomic.Int64
+	client := newPooledClient(t, "1", "1", &created)
+	up := client.uploadManager.GetTransport().(*ReuseTransport)
+	defer up.Close()
+	down := client.downloadManager.GetTransport().(*ReuseTransport)
+	defer down.Close()
+	if !client.Retire() {
+		t.Fatal("the connections in use were not set aside")
+	}
+	if n := setAside(client); n != 2 {
+		t.Fatalf("%d connections count as set aside, want 2", n)
+	}
+
+	client.CloseRetired()
+	if !up.entry.isClosed() || !down.entry.isClosed() {
+		t.Fatalf("closed: the upload connection %v, the download one %v", up.entry.isClosed(), down.entry.isClosed())
+	}
+	if n := setAside(client); n != 0 {
+		t.Fatalf("%d connections count as set aside after CloseRetired, want none", n)
+	}
+	if client.ctx.Err() != nil {
+		t.Fatal("the client was closed with them")
+	}
+	again := client.uploadManager.GetTransport().(*ReuseTransport)
+	defer again.Close()
+	if transportID(again) == transportID(up) {
+		t.Fatal("the pool handed out a connection that was closed")
 	}
 }
