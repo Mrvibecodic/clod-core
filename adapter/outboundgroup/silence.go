@@ -577,11 +577,17 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		gb.failedTesting.Store(false)
 		gb.asked(p, v, failed)
 	}
+	// The witnesses open a connection per probe: p is probed over a new
+	// one too, not over those it keeps, which are what is in doubt.
+	fresh := provider.FreshConns(p)
 	nodes := append([]C.Proxy{p}, first...)
 	answers := gb.askHeld(nodes, d)
 	self, others := answers[0], answers[1:]
 	again := len(more) > 0 && self.known && !self.answered && !self.stale(d.url) && !anyAnswered(others)
 	if again {
+		if !fresh {
+			provider.FreshConns(p)
+		}
 		answers = gb.askHeld(append(nodes, more...), d)
 		self, others = answers[0], answers[1:]
 	}
