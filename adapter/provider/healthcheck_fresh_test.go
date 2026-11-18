@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -239,5 +240,70 @@ func TestTheSecondProbeOfANodeWithSharedConnectionsIsNeverEarlierForASlowerNode(
 		if slow < quick {
 			t.Errorf("timeout %s: hedge at %s after 0.95 s but at %s after 1.05 s", timeout, quick, slow)
 		}
+	}
+}
+
+// stuckPoolNode keeps one connection for all its streams, and that
+// connection is stuck: nothing over it answers until it is set aside.
+type stuckPoolNode struct {
+	C.ProxyAdapter
+	retired atomic.Int32
+}
+
+func (n *stuckPoolNode) RetireConns() bool {
+	n.retired.Add(1)
+	return true
+}
+
+func (n *stuckPoolNode) KeepsConns() bool {
+	return true
+}
+
+func (n *stuckPoolNode) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	if n.retired.Load() == 0 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return n.ProxyAdapter.DialContext(ctx, metadata)
+}
+
+func deadStuckPoolNode(t *testing.T, url string) (*stuckPoolNode, *adapter.Proxy) {
+	t.Helper()
+	node := &stuckPoolNode{ProxyAdapter: outbound.NewDirect()}
+	proxy := adapter.NewProxy(node)
+	proxy.RecordProbe(url, &C.ProbeResult{Held: true, Time: time.Now(), Err: errProbeFailed, Stage: C.ProbeStageDial})
+	if proxy.AliveForTestUrl(url) {
+		t.Fatal("the node must start dead")
+	}
+	return node, proxy
+}
+
+// A dead node that keeps shared connections is probed over a new one: over
+// the stuck one it could not answer until its transport dropped it.
+func TestADeadNodeWithSharedConnectionsIsProbedOverANewOne(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	node, proxy := deadStuckPoolNode(t, target.url())
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), 500, 0, false, nil)
+	t.Cleanup(hc.close)
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probePassed || !proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("outcome %v, alive %v", outcome, proxy.AliveForTestUrl(target.url()))
+	}
+	if got := node.retired.Load(); got != 1 {
+		t.Fatalf("the kept connections were set aside %d times, want once", got)
+	}
+}
+
+// The same for a probe asked out of schedule, a recheck of the dead node.
+func TestARecheckOfADeadNodeWithSharedConnectionsGoesOverANewOne(t *testing.T) {
+	target := newProbeTarget(t, 0)
+	node, proxy := deadStuckPoolNode(t, target.url())
+	const timeout = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), ProbeHedgeDelay+timeout+C.ProbeReserve)
+	defer cancel()
+	if _, err := ProbeNode(ctx, proxy, target.url(), nil, timeout); err != nil || !proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("err %v, alive %v", err, proxy.AliveForTestUrl(target.url()))
+	}
+	if got := node.retired.Load(); got != 1 {
+		t.Fatalf("the kept connections were set aside %d times, want once", got)
 	}
 }
