@@ -321,13 +321,14 @@ func alternateHosts(proxies []C.Proxy) []C.Proxy {
 // probeHedgeDelay is how long the first probe gets before a second one is
 // started beside it: long enough for a healthy node to answer and never see a
 // second probe, short enough that a node whose first probe stalled is judged
-// within one timeout after it. The worst case for a node is thus
-// probeHedgeDelay + timeout, not two timeouts.
+// within about one timeout after it, not two timeouts.
 const probeHedgeDelay = time.Second
 
 // ProbeHedgeDelay is probeHedgeDelay for callers of ProbeNode that budget a
-// probe: it may take ProbeHedgeDelay plus its timeout, and probeAbandonGrace
-// more when a connection does not end by its deadline.
+// probe: given ProbeHedgeDelay, its timeout and C.ProbeReserve, it ends with
+// its verdict before that deadline, the wait for its turn to the host
+// included; probeAbandonGrace more when a connection does not end by its
+// deadline, and then the probe found nothing out.
 const ProbeHedgeDelay = probeHedgeDelay
 
 // probeHedgeGrace is how long the first probe still gets once the second one
@@ -350,8 +351,11 @@ const probeAbandonGrace = time.Second
 // handshake, not only the unified delay) gets it at twice its usual time, so
 // that a normal answer comes before it and one probe a round is enough, but
 // never so late that the second probe has less than one and a half of that
-// time left: the probe as a whole still ends by the hedge delay and a timeout,
-// the budget callers of ProbeNode count on. A slow node that keeps shared
+// time left before the hedge delay and a timeout. The second probe has a
+// timeout of its own; probeEnd cuts it short only after a hedge later than the
+// hedge delay and ProbeReserve less the margin (a slow node at a timeout over
+// about 5 s), and even then leaves it more than that time and a half.
+// A slow node that keeps shared
 // connections gets it no earlier than at half the timeout either, within
 // that same bound, so that it never has its connections set aside sooner
 // than a quicker node would.
@@ -484,11 +488,12 @@ func (r *probeRun) finished() bool {
 func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], first *probeRun, fresh bool) *probeRun {
 	hedge := first != nil
 	deadline := time.Now().Add(hc.timeout)
+	var end time.Time
 	if hedge {
-		// The second probe ends when it would after the default hedge delay,
-		// however late it starts: a probe takes at most ProbeHedgeDelay and a
-		// timeout.
-		deadline = first.started.Add(probeHedgeDelay + hc.timeout)
+		// The second probe has a timeout of its own from its start: one
+		// resent packet on a slow link must not cost it the answer. The
+		// probe as a whole still ends by probeEnd.
+		end = hc.probeEnd(first.started)
 	}
 	base, cancel := context.WithCancel(hc.ctx)
 	if hedge {
@@ -505,13 +510,28 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 	// was left too little of its timeout to answer.
 	until, bounded := hc.ctx.Deadline()
 	turn := func() error {
+		if hedge {
+			// The second probe waits for its turn only as long as it keeps
+			// its whole timeout before the end, and then takes what is left.
+			limit := time.Until(end) - hc.timeout
+			if limit < 0 {
+				limit = 0
+			}
+			if err := C.ProbePaceWithin(base, C.ProbeHostOf(p), limit); err != nil {
+				return err
+			}
+			if deadline = time.Now().Add(hc.timeout); deadline.After(end) {
+				deadline = end
+			}
+			return nil
+		}
 		ctx := base
 		if bounded {
 			limit := deadline
 			// The wait of the first probe leaves the caller the hedge delay,
 			// a timeout and the grace, or a second probe failing at the
 			// deadline would be taken for a cancel.
-			if latest := until.Add(C.ProbeReserve - probeHedgeDelay - hc.timeout - probeHedgeGrace); !hedge && latest.Before(limit) {
+			if latest := until.Add(C.ProbeReserve - probeHedgeDelay - hc.timeout - probeHedgeGrace); latest.Before(limit) {
 				limit = latest
 			}
 			var stop context.CancelFunc
@@ -579,6 +599,23 @@ func (hc *HealthCheck) startProbe(p C.Proxy, url string, expectedStatus utils.In
 		_, _ = p.URLTest(ctx, url, expectedStatus)
 	}()
 	return run
+}
+
+// probeEndMargin is how long before the end of a probe its verdict is due: an
+// answer of the second probe may still wait probeHedgeGrace for the first.
+const probeEndMargin = probeHedgeGrace
+
+// probeEnd is when a probe whose first try started at started ends at the
+// latest, its second try included: the hedge delay, a timeout and
+// ProbeReserve after that start, less the margin, and never past the caller's
+// deadline less the margin. Within it the second try has its own timeout: it
+// is cut short only when it starts so late that a whole timeout does not fit.
+func (hc *HealthCheck) probeEnd(started time.Time) time.Time {
+	end := started.Add(probeHedgeDelay + hc.timeout + C.ProbeReserve - probeEndMargin)
+	if until, ok := hc.ctx.Deadline(); ok && until.Add(-probeEndMargin).Before(end) {
+		end = until.Add(-probeEndMargin)
+	}
+	return end
 }
 
 // retireConns has the streams p opens next go over new connections and
@@ -770,9 +807,8 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 // ProbeNode probes p the way the scheduled health check does: a second probe
 // beside a stalled first one, a failure confirmed before the node is marked
 // dead, one probe per node at a time shared with any check already probing
-// it. ctx bounds the whole probe, timeout each of its (at most two) attempts,
-// so it may take ProbeHedgeDelay plus timeout (see ProbeHedgeDelay for a
-// connection that does not end by its deadline). A probe that found nothing out
+// it. ctx bounds the whole probe, timeout each of its (at most two) attempts;
+// see ProbeHedgeDelay for the budget. A probe that found nothing out
 // (ctx ended, the network was switching) returns ctx's error or
 // ErrProbeDiscarded and records nothing.
 func ProbeNode(ctx context.Context, p C.Proxy, url string, expectedStatus utils.IntRanges[uint16], timeout time.Duration) (uint16, error) {

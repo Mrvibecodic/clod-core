@@ -91,15 +91,21 @@ var probePacer = struct {
 // deadline of ctx. It returns ctx's error if ctx ends while waiting. An empty
 // host is not paced.
 func ProbePace(ctx context.Context, host string) error {
-	if host == "" || ctx.Value(probePacedKey{}) != nil {
-		ProbeBooked(ctx)
-		return nil
-	}
 	limit := time.Duration(-1)
 	if deadline, ok := ctx.Deadline(); ok {
 		if limit = time.Until(deadline) - ProbeReserve; limit < 0 {
 			limit = 0
 		}
+	}
+	return ProbePaceWithin(ctx, host, limit)
+}
+
+// ProbePaceWithin is ProbePace with the wait bounded by limit instead of by
+// the deadline of ctx; a negative limit is none.
+func ProbePaceWithin(ctx context.Context, host string, limit time.Duration) error {
+	if host == "" || ctx.Value(probePacedKey{}) != nil {
+		ProbeBooked(ctx)
+		return nil
 	}
 	wait := reserveProbeStart(host, time.Now(), limit)
 	ProbeBooked(ctx)

@@ -574,7 +574,7 @@ func TestASlowNodeThatStallsGetsALaterSecondProbe(t *testing.T) {
 	}
 }
 
-func TestTheLaterSecondProbeEndsWithinTheHedgeAndTimeout(t *testing.T) {
+func TestTheLaterSecondProbeHasItsOwnTimeout(t *testing.T) {
 	const slow = probeHedgeDelay + 200*time.Millisecond
 	const timeout = 3000
 	target := newProbeTarget(t, slow, "slow", "slow", "stall", "stall")
@@ -585,16 +585,69 @@ func TestTheLaterSecondProbeEndsWithinTheHedgeAndTimeout(t *testing.T) {
 		t.Fatalf("first round: %v", outcome)
 	}
 	before := target.connections()
+	at := hc.hedgeAt(proxy.LastProbeElapsed(target.url()), false)
 	began := time.Now()
 	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeStalled {
 		t.Fatalf("a slow node whose probes stalled: %v, want stalled", outcome)
 	}
-	worst := probeHedgeDelay + timeout*time.Millisecond
+	worst := at + timeout*time.Millisecond
 	if elapsed := time.Since(began); elapsed > worst+300*time.Millisecond || elapsed < worst-100*time.Millisecond {
-		t.Fatalf("the later second probe ends by hedge+timeout (%s), took %s", worst, elapsed)
+		t.Fatalf("the later second probe ends a timeout after its start (%s), took %s", worst, elapsed)
 	}
 	if got := target.connections() - before; got != 2 {
 		t.Fatalf("two probes, saw %d", got)
+	}
+}
+
+// The second probe has a whole timeout of its own wherever the hedge puts
+// it, as long as the probe as a whole fits ProbeReserve past the hedge delay
+// and a timeout; it was left only what remained of the hedge delay and a
+// timeout after the first probe's start.
+func TestTheSecondProbeKeepsItsWholeTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{1000, 2000, 3000, 4000, 5000, 8000, 10000} {
+		timeout *= time.Millisecond
+		hc := &HealthCheck{ctx: context.Background(), timeout: timeout}
+		for _, elapsed := range []time.Duration{0, 500, 950, 1050, 1500, 2000, 2500, 3000, 4000, 6000} {
+			elapsed *= time.Millisecond
+			for _, keeps := range []bool{false, true} {
+				at := hc.hedgeAt(elapsed, keeps)
+				started := time.Now()
+				budget := hc.probeEnd(started).Sub(started.Add(at))
+				if budget > timeout {
+					budget = timeout
+				}
+				allowed := probeHedgeDelay + timeout + C.ProbeReserve - probeEndMargin - at
+				if want := timeout; budget < want && budget < allowed {
+					t.Errorf("timeout %s, usual %s, keeps %t: hedge at %s, the second probe gets %s", timeout, elapsed, keeps, at, budget)
+				}
+				if timeout <= 5*time.Second && budget < timeout {
+					t.Errorf("timeout %s, usual %s, keeps %t: hedge at %s, the second probe gets %s, want its whole timeout", timeout, elapsed, keeps, at, budget)
+				}
+				if budget < elapsed*3/2 && budget < timeout {
+					t.Errorf("timeout %s, usual %s, keeps %t: the second probe gets %s, less than its usual time and a half", timeout, elapsed, keeps, budget)
+				}
+			}
+		}
+	}
+}
+
+// A second probe that answers after the hedge delay and a timeout from the
+// first one's start, but within its own timeout, is the node's answer.
+func TestASecondProbeAnsweringWithinItsOwnTimeoutCounts(t *testing.T) {
+	const timeout = 3000 * time.Millisecond
+	const usual = 1600 * time.Millisecond
+	// The hedge comes at 1.6 s, the old end of the probe was at 4 s, the
+	// second probe answers at about 4.3 s.
+	target := newProbeTarget(t, 2700*time.Millisecond, "stall", "slow")
+	proxy := adapter.NewProxy(outbound.NewDirect())
+	seedElapsed(proxy, target.url(), usual)
+	hc := NewHealthCheck([]C.Proxy{proxy}, target.url(), uint(timeout/time.Millisecond), 0, false, nil)
+	t.Cleanup(hc.close)
+	if at := hc.hedgeAt(usual, false); at != usual {
+		t.Fatalf("hedge at %s, the test wants %s", at, usual)
+	}
+	if outcome, _ := hc.probe(proxy, target.url(), nil); outcome != probeRecovered || !proxy.AliveForTestUrl(target.url()) {
+		t.Fatalf("outcome %v, alive %v", outcome, proxy.AliveForTestUrl(target.url()))
 	}
 }
 
