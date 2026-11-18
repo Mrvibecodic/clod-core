@@ -525,8 +525,11 @@ func (gb *GroupBase) askHeld(nodes []C.Proxy, d doubt) []answer {
 // where the group goes.
 //
 // The first are few: the best node, and, so that they do not all go down
-// with p, the best node of another kind and the best node of another server,
-// if there are such. Nodes of one kind or of one server stop together.
+// with p, the best node of another kind (see kindOf) and the best node of
+// another server, if there are such. Nodes of one kind or of one server stop
+// together. The node of another kind is taken from another server than p's
+// if there is one: a server that went down whole takes all its kinds with
+// it.
 //
 // more is asked only when none of the first answered: a few nodes, each of a
 // kind or of a server not asked yet. Before the group takes it for the
@@ -541,20 +544,27 @@ func witnesses(p C.Proxy, next []C.Proxy) (first, more []C.Proxy) {
 			servers = append(servers, node)
 		}
 	}
-	kinds, hosts := map[C.AdapterType]bool{p.Type(): true}, map[string]bool{C.ProbeHostOf(p): true}
+	home := C.ProbeHostOf(p)
+	kinds, hosts := map[string]bool{kindOf(p): true}, map[string]bool{home: true}
 	taken := make(map[C.Proxy]bool, silenceWitnesses+silenceMoreWitnesses)
 	take := func(list *[]C.Proxy, node C.Proxy) {
 		*list = append(*list, node)
-		taken[node], kinds[node.Type()], hosts[C.ProbeHostOf(node)] = true, true, true
+		taken[node], kinds[kindOf(node)], hosts[C.ProbeHostOf(node)] = true, true, true
 	}
 	if len(servers) > 0 {
 		take(&first, servers[0])
 	}
-	for _, node := range servers {
-		if len(first) < silenceWitnesses && !taken[node] && !kinds[node.Type()] {
-			take(&first, node)
-			break
+	otherKind := func(away bool) bool {
+		for _, node := range servers {
+			if len(first) < silenceWitnesses && !taken[node] && !kinds[kindOf(node)] && (!away || C.ProbeHostOf(node) != home) {
+				take(&first, node)
+				return true
+			}
 		}
+		return false
+	}
+	if !otherKind(true) {
+		otherKind(false)
 	}
 	for _, node := range servers {
 		if len(first) < silenceWitnesses && !taken[node] && !hosts[C.ProbeHostOf(node)] {
@@ -571,7 +581,7 @@ func witnesses(p C.Proxy, next []C.Proxy) (first, more []C.Proxy) {
 		if len(more) == silenceMoreWitnesses {
 			break
 		}
-		if !taken[node] && (!kinds[node.Type()] || !hosts[C.ProbeHostOf(node)]) {
+		if !taken[node] && (!kinds[kindOf(node)] || !hosts[C.ProbeHostOf(node)]) {
 			take(&more, node)
 		}
 	}
