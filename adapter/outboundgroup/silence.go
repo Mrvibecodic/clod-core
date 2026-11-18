@@ -553,9 +553,9 @@ func (gb *GroupBase) failedOf(p C.Proxy, born time.Time, d doubt) {
 // askOf answers the connections p failed or left unanswered. It probes p and
 // a few nodes the group would go to, at once, and writes nothing down until
 // it has their answers:
-//   - p answers: it was the site, nothing is written, so the delay measured at
-//     a bad moment moves the group nowhere. Only a second try p needed where
-//     another node did not is written to p;
+//   - p answers, at its first try or its second: it was the site, nothing is
+//     written, so the delay measured at a bad moment moves the group nowhere,
+//     and a try it needed then costs it no rank;
 //   - p is silent and every other node answers at its first try: p is dead,
 //     its answer is written and the group leaves;
 //   - anything else (a node beside it silent too, or answering only at its
@@ -621,18 +621,6 @@ func (gb *GroupBase) askOf(p C.Proxy, d doubt, failed bool) {
 		end(verdictNone)
 		return
 	case self.answered:
-		// A node that answered at its second try beside one that answered
-		// at the first is unsteady, and that is written down: url-test ranks
-		// it below the steady ones. With no node steady it is the network.
-		if !self.steady {
-			for _, other := range others {
-				if other.steady {
-					self.replay(d.url)
-					log.Infoln("[Проба] %s: ответил со второй попытки, узлы рядом — с первой", p.Name())
-					break
-				}
-			}
-		}
 		end(verdictAlive)
 		return
 	}

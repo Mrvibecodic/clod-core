@@ -224,3 +224,17 @@ func TestAWitnessThatAnsweredOverANewConnectionIsNotSteady(t *testing.T) {
 		t.Fatalf("the slow witness: dead %v, records %d", b.dead.Load(), b.records())
 	}
 }
+
+// A node that needed its second try where a node beside it answered at the
+// first is alive, and nothing is written to it: a check made when the node is
+// at its worst costs it no rank.
+func TestANodeThatAnswersAtItsSecondTryIsWrittenNothing(t *testing.T) {
+	a, b := askedNode("A", "192.0.2.1", true), askedNode("B", "192.0.2.2", true)
+	a.second.Store(true)
+	gb, _, d := askedGroup(a, b)
+	gb.askOf(a, d, false)
+	noneDead(t, a, b)
+	if !quiet(gb) {
+		t.Fatal("no pause after a node found alive")
+	}
+}
