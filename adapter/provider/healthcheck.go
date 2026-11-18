@@ -748,10 +748,10 @@ func (hc *HealthCheck) probeOnce(p C.Proxy, recorder C.ProbeRecorder, url string
 			}
 			// A first probe whose failure was set aside (the network was
 			// switching) is no failure of the node.
-			// A first probe left hanging on a connection set aside since
-			// says that connection was stuck, not that the node is unsteady;
-			// one that failed by itself is the node's failure all the same.
-			if first.finished() && first.result.Held || !first.finished() && !second.fresh.Load() {
+			// A first probe of a node whose kept connections the second one
+			// set aside went over a connection that was stuck or broken:
+			// hanging or failed, it says nothing about the node itself.
+			if !second.fresh.Load() && (!first.finished() || first.result.Held) {
 				recorder.RecordSoftFailure(url, first.started)
 			}
 			recorder.RecordProbe(url, second.result)
