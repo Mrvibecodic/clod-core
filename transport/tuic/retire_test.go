@@ -394,3 +394,25 @@ func TestAPacketConnectionFitsBesideAnIdleStreamConnection(t *testing.T) {
 		t.Fatalf("left in the pool: %d and %d, want 0 and 0", pool.tcpClients.Len(), pool.udpClients.Len())
 	}
 }
+
+// A change of network closes the connections set aside along with the ones in
+// the pool and leaves none counted.
+func TestResetNetworkClosesTheConnectionsSetAside(t *testing.T) {
+	pool := &PoolClient{}
+	old, current := &countedClient{}, &countedClient{}
+	old.streams.Store(1)
+	defer old.streams.Store(0)
+	pool.tcpClients.PushFront(old)
+	if !pool.Retire() {
+		t.Fatal("the connection was not set aside")
+	}
+	pool.tcpClients.PushFront(current)
+
+	pool.ResetNetwork()
+	if !old.closed.Load() || !current.closed.Load() {
+		t.Fatalf("closed: the one set aside %v, the one in the pool %v", old.closed.Load(), current.closed.Load())
+	}
+	if n := setAside(pool); n != 0 {
+		t.Fatalf("%d connections count as set aside after ResetNetwork, want none", n)
+	}
+}

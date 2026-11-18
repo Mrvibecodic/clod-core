@@ -138,6 +138,8 @@ func (t *PoolClient) ResetNetwork() {
 	for _, client := range stale {
 		client.Close()
 	}
+	// The ones set aside belong to the network left as well.
+	t.CloseRetired()
 }
 
 func NewPoolClientV4(clientOption *ClientOptionV4, dialFn DialFunc) *PoolClient {

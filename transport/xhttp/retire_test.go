@@ -398,3 +398,28 @@ func TestCloseRetiredClosesTheConnectionsSetAside(t *testing.T) {
 		t.Fatal("the pool handed out a connection that was closed")
 	}
 }
+
+// A change of network closes the connections set aside along with the pooled
+// ones and leaves none counted; the client goes on.
+func TestResetNetworkClosesTheConnectionsSetAside(t *testing.T) {
+	var created atomic.Int64
+	client := newPooledClient(t, "1", "1", &created)
+	old := client.downloadManager.GetTransport().(*ReuseTransport)
+	defer old.Close()
+	if !client.Retire() {
+		t.Fatal("the connection in use was not set aside")
+	}
+	current := client.downloadManager.GetTransport().(*ReuseTransport)
+	defer current.Close()
+
+	client.ResetNetwork()
+	if !old.entry.isClosed() || !current.entry.isClosed() {
+		t.Fatalf("closed: the one set aside %v, the pooled one %v", old.entry.isClosed(), current.entry.isClosed())
+	}
+	if n := setAside(client); n != 0 {
+		t.Fatalf("%d connections count as set aside after ResetNetwork, want none", n)
+	}
+	if client.ctx.Err() != nil {
+		t.Fatal("the client was closed")
+	}
+}

@@ -296,10 +296,12 @@ func NewClient(cfg *Config, makeTransport TransportMaker, makeDownloadTransport 
 }
 
 // ResetNetwork closes the pooled connections: they belong to the network the
-// device has left. The client stays usable and dials new ones.
+// device has left, and so do the ones set aside. The client stays usable and
+// dials new ones.
 func (c *Client) ResetNetwork() {
 	_ = c.uploadManager.Close()
 	_ = c.downloadManager.Close()
+	c.CloseRetired()
 }
 
 func (c *Client) Close() error {
