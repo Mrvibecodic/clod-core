@@ -328,10 +328,12 @@ func TestANodeThatAnswersWhileItsConnectionsFailIsAskedAgainSoon(t *testing.T) {
 	}
 }
 
-// A group that is on a dead node already has every node checked.
+// A group that is on a dead node with no other node alive has every node
+// checked.
 func TestFailedConnectionsThroughADeadNodeCheckTheWholeGroup(t *testing.T) {
 	a, b := askedNode("A", "192.0.2.1", false), askedNode("B", "192.0.2.2", true)
 	a.dead.Store(true)
+	b.dead.Store(true)
 	gb, provider, d := askedGroup(a, b)
 	gb.failedOf(a, time.Now(), d)
 	if provider.checks.Load() != 1 || a.asks.Load() != 0 {
