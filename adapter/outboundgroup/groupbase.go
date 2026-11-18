@@ -38,10 +38,13 @@ type GroupBase struct {
 	rechecks          atomic.Int32
 	emptyFallback     C.Proxy
 	// reviveNext is when a dial through a node marked dead may start the next
-	// check, reviveWait the pause after it; see onDeadNodeDialed.
+	// check, reviveWait the pause after it, reviveAt when the last one
+	// started, reviveBusy that one runs; see onDeadNodeDialed.
 	reviveMux  sync.Mutex
 	reviveNext time.Time
 	reviveWait time.Duration
+	reviveAt   time.Time
+	reviveBusy bool
 	// failedDeadNext is when failed connections through a dead node may have
 	// the whole group checked again, failedDeadPause the pause after that;
 	// see failedDead.
@@ -358,6 +361,9 @@ const (
 	reviveMaxWait   = 10 * time.Minute
 	// reviveRetryWait is how long a check that has just ended is not repeated.
 	reviveRetryWait = time.Second
+	// reviveUnreachedWait is how long a check that did not reach the node
+	// holds the next one back.
+	reviveUnreachedWait = 5 * time.Second
 )
 
 // onDeadNodeDialed is told of a connection through p that got an answer. A group
@@ -367,15 +373,26 @@ const (
 // checked at once. The next such check waits reviveFirstWait; a check that
 // leaves p dead doubles the wait, up to reviveMaxWait, so that a node that
 // carries traffic but fails its probes does not have the group probed over
-// and over. A check that did not reach p is no such check: one of the group
-// that is already running probes p itself, and one asked for right after
-// another has ended is asked for once more.
+// and over. A node of the group alive since the last check ends that: the
+// outage is another one, and it starts with the short wait. A check that did
+// not reach p is no such check: one of the group that is already running
+// probes p itself, and one asked for right after another has ended is asked
+// for once more; if that did not reach p either, the next connection that
+// works may ask again after reviveUnreachedWait.
 func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
 	if p.AliveForTestUrl(testUrl) || gb.failedTesting.Load() {
 		return
 	}
 	gb.reviveMux.Lock()
+	// No second check starts while one runs.
+	if gb.reviveBusy {
+		gb.reviveMux.Unlock()
+		return
+	}
 	now := time.Now()
+	if (now.Before(gb.reviveNext) || gb.reviveWait > reviveFirstWait) && gb.aliveSince(gb.reviveAt, testUrl) {
+		gb.reviveWait, gb.reviveNext = reviveFirstWait, time.Time{}
+	}
 	if now.Before(gb.reviveNext) {
 		gb.reviveMux.Unlock()
 		return
@@ -383,8 +400,7 @@ func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
 	if gb.reviveWait == 0 {
 		gb.reviveWait = reviveFirstWait
 	}
-	// No second check starts while this one runs.
-	gb.reviveNext = now.Add(reviveMaxWait)
+	gb.reviveBusy, gb.reviveAt = true, now
 	gb.reviveMux.Unlock()
 
 	log.Infoln("[Проба] %s: через %s пришёл ответ, а узел помечен мёртвым — группа перепроверяется", gb.Name(), p.Name())
@@ -397,18 +413,35 @@ func (gb *GroupBase) onDeadNodeDialed(p C.Proxy, testUrl string, fn func()) {
 		}
 		gb.reviveMux.Lock()
 		defer gb.reviveMux.Unlock()
+		wait := gb.reviveWait
 		switch {
 		case p.AliveForTestUrl(testUrl):
-			gb.reviveWait = reviveFirstWait
+			gb.reviveWait, wait = reviveFirstWait, reviveFirstWait
 		case !lastProbe(p, testUrl).Equal(probed):
 			// A check that did not reach p either time found nothing out:
 			// only one that left p dead makes the wait longer.
 			if gb.reviveWait *= 2; gb.reviveWait > reviveMaxWait {
 				gb.reviveWait = reviveMaxWait
 			}
+			wait = gb.reviveWait
+		default:
+			wait = reviveUnreachedWait
 		}
-		gb.reviveNext = time.Now().Add(gb.reviveWait)
+		gb.reviveNext, gb.reviveBusy = time.Now().Add(wait), false
 	}()
+}
+
+// aliveSince reports whether a node of the group answered a probe after t.
+func (gb *GroupBase) aliveSince(t time.Time, testUrl string) bool {
+	for _, proxy := range gb.GetProxies(false) {
+		history := probeHistory(proxy, testUrl)
+		for i := len(history) - 1; i >= 0 && history[i].Time.After(t); i-- {
+			if history[i].Delay > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // probeHistory is what the checks recorded of p at url.
