@@ -33,6 +33,13 @@ func (gb *GroupBase) leftDead(p C.Proxy, d doubt) {
 	}
 }
 
+// recheckControlPauses are the waits before the control probes a url-test
+// group makes of a node the series found alive again, one probe after each:
+// at 15, 30, 45 and 60 s. A node that is back for less than a minute is not
+// gone back to, and neither is one that goes down for longer than a pause
+// within that minute.
+var recheckControlPauses = []time.Duration{15 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second}
+
 // recheck probes p after each of the pauses. The series ends when p is
 // alive, when a newer series of the group has taken its place, or when p is
 // no longer one of the group's nodes. A probe of p by someone else does not
@@ -40,38 +47,120 @@ func (gb *GroupBase) leftDead(p C.Proxy, d doubt) {
 // many and do not follow it up. A probe of theirs that is fresh at a turn is
 // taken for the turn's own.
 func (gb *GroupBase) recheck(p C.Proxy, d doubt, pauses []time.Duration) {
+	gb.recheckEvery(p, d, pauses, recheckControlPauses, 0)
+}
+
+// recheckEvery starts the series of p, with controls the waits before the
+// control probes; see revived. A series started in place of another, after,
+// starts only if no newer one has taken that one's place.
+func (gb *GroupBase) recheckEvery(p C.Proxy, d doubt, pauses []time.Duration, controls []time.Duration, after int32) {
 	if p.AliveForTestUrl(d.url) {
 		return
 	}
 	gb.recheckMux.Lock()
+	if after != 0 && gb.rechecks.Load() != after {
+		gb.recheckMux.Unlock()
+		return
+	}
 	series := gb.rechecks.Add(1)
 	gb.recheckOf = p
+	// A probation belongs to the series it was found alive by.
+	gb.probation = nil
 	gb.recheckMux.Unlock()
 	seen := lastProbe(p, d.url)
 	go func() {
 		defer gb.recheckEnded(series)
-		timeout := time.Duration(gb.testTimeout) * time.Millisecond
-		expected, _ := utils.NewUnsignedRanges[uint16](d.expected)
 		for _, pause := range pauses {
 			time.Sleep(pause)
 			if !gb.rechecking(p, series) {
 				return
 			}
-			if last := lastProbe(p, d.url); last.Equal(seen) || time.Since(last) >= recheckFresh {
-				ctx, cancel := context.WithTimeout(context.Background(), provider.ProbeHedgeDelay+timeout+C.ProbeReserve)
-				_, _ = provider.ProbeNode(ctx, p, d.url, expected, timeout)
-				cancel()
-			}
+			seen = gb.recheckTurn(p, d, seen)
 			if p.AliveForTestUrl(d.url) {
 				log.Infoln("[Проба] %s снова отвечает", p.Name())
-				if d.again != nil {
-					d.again()
-				}
+				gb.revived(p, d, series, func() { gb.recheckEvery(p, d, pauses, controls, series) }, controls)
 				return
 			}
-			seen = lastProbe(p, d.url)
 		}
 	}()
+}
+
+// recheckTurn probes p unless someone else has, since seen, and recently
+// enough for the series to take their answer. It returns when p was last
+// probed.
+func (gb *GroupBase) recheckTurn(p C.Proxy, d doubt, seen time.Time) time.Time {
+	if last := lastProbe(p, d.url); last.Equal(seen) || time.Since(last) >= recheckFresh {
+		timeout := time.Duration(gb.testTimeout) * time.Millisecond
+		expected, _ := utils.NewUnsignedRanges[uint16](d.expected)
+		ctx, cancel := context.WithTimeout(context.Background(), provider.ProbeHedgeDelay+timeout+C.ProbeReserve)
+		_, _ = provider.ProbeNode(ctx, p, d.url, expected, timeout)
+		cancel()
+	}
+	return lastProbe(p, d.url)
+}
+
+// revived gives p, found alive again, back to the group. A url-test group
+// ranks a node by its last few probes, and the failures among them keep it
+// off a node that is back for minutes: control probes, after each of the
+// controls waits, that p all passes leave it none, and the group makes its
+// choice anew. A control probe that fails leaves p dead by its own record,
+// and the series starts over unless a newer one has taken its place. A node
+// that is up for a moment and down again is not gone back to: its failures
+// stay in the records the group ranks it by. Neither is one that passed the
+// control probes with a failure still among the records it is ranked by, a
+// try a control probe needed included: the scheduled checks rank it.
+// While its control probes run, p is on probation: the group does not go to
+// it for its speed, which its clean records would have it do long before
+// the last one.
+//
+// Any other group takes p back as soon as it is alive.
+func (gb *GroupBase) revived(p C.Proxy, d doubt, series int32, anew func(), controls []time.Duration) {
+	if gb.Type() == C.URLTest {
+		// Until the control probes are over the group does not go to p for
+		// its speed: three clean records are enough for that, and p would
+		// be gone back to before most of its control probes.
+		gb.recheckMux.Lock()
+		if gb.rechecks.Load() == series {
+			gb.probation, gb.probationOf = p, series
+		}
+		gb.recheckMux.Unlock()
+		defer gb.endProbation(series)
+		seen := lastProbe(p, d.url)
+		for _, pause := range controls {
+			time.Sleep(pause)
+			if !gb.rechecking(p, series) {
+				return
+			}
+			if seen = gb.recheckTurn(p, d, seen); !p.AliveForTestUrl(d.url) {
+				anew()
+				return
+			}
+		}
+		gb.endProbation(series)
+		if !cleanWindow(p, d.url) {
+			return
+		}
+		log.Infoln("[Проба] %s: контрольные пробы прошли, узел снова в выборе", p.Name())
+	}
+	if d.again != nil {
+		d.again()
+	}
+}
+
+// cleanWindow reports whether the records p is ranked by, the last
+// flakyWindow, are all answers: no failure among them, a try a probe needed
+// before it answered included.
+func cleanWindow(p C.Proxy, url string) bool {
+	history := probeHistory(p, url)
+	if len(history) < flakyWindow {
+		return false
+	}
+	for _, record := range history[len(history)-flakyWindow:] {
+		if record.Delay == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // recheckEnded marks the series over unless a newer one has taken its place.
@@ -81,6 +170,28 @@ func (gb *GroupBase) recheckEnded(series int32) {
 		gb.recheckOf = nil
 	}
 	gb.recheckMux.Unlock()
+	gb.endProbation(series)
+}
+
+// endProbation ends the probation the series put its node on, if it did.
+func (gb *GroupBase) endProbation(series int32) {
+	gb.recheckMux.Lock()
+	if gb.probationOf == series {
+		gb.probation = nil
+	}
+	gb.recheckMux.Unlock()
+}
+
+// onProbation is the node the group's series found alive and is making its
+// control probes of, nil if none: the group does not go to it for its speed.
+// A probation is the series' own: a newer series ends it.
+func (gb *GroupBase) onProbation() C.Proxy {
+	gb.recheckMux.Lock()
+	defer gb.recheckMux.Unlock()
+	if gb.probation == nil || gb.probationOf != gb.rechecks.Load() {
+		return nil
+	}
+	return gb.probation
 }
 
 // rechecking reports whether the series is still the group's latest and p
