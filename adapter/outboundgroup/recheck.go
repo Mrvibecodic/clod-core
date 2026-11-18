@@ -40,6 +40,12 @@ func (gb *GroupBase) leftDead(p C.Proxy, d doubt) {
 // within that minute.
 var recheckControlPauses = []time.Duration{15 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second}
 
+// recheckRestarts is how many times in a row the series of one node starts
+// over after a control probe it failed. A node that keeps coming and going
+// is left to the scheduled checks after that: the series would follow it for
+// as long as it flaps.
+const recheckRestarts = 3
+
 // recheck probes p after each of the pauses. The series ends when p is
 // alive, when a newer series of the group has taken its place, or when p is
 // no longer one of the group's nodes. A probe of p by someone else does not
@@ -52,7 +58,8 @@ func (gb *GroupBase) recheck(p C.Proxy, d doubt, pauses []time.Duration) {
 
 // recheckEvery starts the series of p, with controls the waits before the
 // control probes; see revived. A series started in place of another, after,
-// starts only if no newer one has taken that one's place.
+// starts only if no newer one has taken that one's place, and only
+// recheckRestarts times in a row: a series started by a leave counts anew.
 func (gb *GroupBase) recheckEvery(p C.Proxy, d doubt, pauses []time.Duration, controls []time.Duration, after int32) {
 	if p.AliveForTestUrl(d.url) {
 		return
@@ -60,6 +67,13 @@ func (gb *GroupBase) recheckEvery(p C.Proxy, d doubt, pauses []time.Duration, co
 	gb.recheckMux.Lock()
 	if after != 0 && gb.rechecks.Load() != after {
 		gb.recheckMux.Unlock()
+		return
+	}
+	if after == 0 {
+		gb.recheckRestarts = 0
+	} else if gb.recheckRestarts++; gb.recheckRestarts > recheckRestarts {
+		gb.recheckMux.Unlock()
+		log.Infoln("[Проба] %s: то отвечает, то нет — дальше его проверяет только плановая проверка", p.Name())
 		return
 	}
 	series := gb.rechecks.Add(1)
@@ -144,6 +158,11 @@ func (gb *GroupBase) revived(p C.Proxy, d doubt, series int32, anew func(), cont
 				return
 			}
 		}
+		gb.recheckMux.Lock()
+		if gb.rechecks.Load() == series {
+			gb.recheckRestarts = 0
+		}
+		gb.recheckMux.Unlock()
 		gb.endProbation(series)
 		if !cleanWindow(p, d.url) {
 			return

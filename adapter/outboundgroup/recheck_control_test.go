@@ -176,6 +176,36 @@ func TestFallbackMakesNoControlProbes(t *testing.T) {
 	}
 }
 
+// A node alive at every turn and dead at every control probe has its series
+// start over recheckRestarts times in a row and no more: then only the
+// scheduled checks probe it. The group leaving the node anew counts anew.
+func TestAFlappingNodeHasItsSeriesStartOverThreeTimesAtMost(t *testing.T) {
+	var script []bool
+	for i := 0; i < 20; i++ {
+		script = append(script, true, false)
+	}
+	a, b := scripted("A", 10, script...), scripted("B", 300, true)
+	group := controlGroup(t, a, b)
+	pause := 10 * time.Millisecond
+	d := group.doubt(a)
+	// A turn and a control probe for the series and for each start over.
+	want := int32(2 * (1 + recheckRestarts))
+	group.recheckEvery(a, d, []time.Duration{pause, pause}, controlsOf(pause), 0)
+	ended := func() bool { node, _ := followed(group.GroupBase); return node == nil }
+	waitFor(t, 5*time.Second, "the series of the flapping node did not end", ended)
+	time.Sleep(time.Second)
+	if got := a.asks.Load(); got != want || !ended() {
+		t.Fatalf("the node was probed %d times, want %d", got, want)
+	}
+	// A leave starts a series of its own, not one in place of another.
+	group.recheckEvery(a, d, []time.Duration{pause, pause}, controlsOf(pause), 0)
+	waitFor(t, 5*time.Second, "a new leave did not start the count anew", func() bool { return a.asks.Load() == 2*want && ended() })
+	time.Sleep(time.Second)
+	if got := a.asks.Load(); got != 2*want {
+		t.Fatalf("the node was probed %d times, want %d", got, 2*want)
+	}
+}
+
 // softControlNode has its last control probe pass at its second try: the
 // first try is written down as a soft failure.
 type softControlNode struct {
