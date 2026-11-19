@@ -1,6 +1,7 @@
 package outboundgroup
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -27,4 +28,18 @@ func TestSilenceUnderTheProbeHoldIsNotCounted(t *testing.T) {
 
 	silent(gb, node, asks, silenceCount)
 	asks.want(t, 1)
+}
+
+// Streams a network reset closes under the probe hold (net.ErrClosed from a
+// layer below, before the connections themselves are closed) are no cuts.
+func TestStreamsClosedByANetworkResetUnderTheHoldAreNoCuts(t *testing.T) {
+	gb, node, asks := silentGroup(), &measuredProxy{name: "A", alive: true}, &askCounter{}
+	takenLongAgo(gb, node)
+	t.Cleanup(func() { C.SetProbeHoldUntil(time.Time{}) })
+	inner, _ := endedConns(t, gb, node, asks, silenceCount, nil)
+	C.SetProbeHoldUntil(time.Now().Add(5 * time.Second))
+	for _, c := range inner {
+		c.end(net.ErrClosed)
+	}
+	asks.want(t, 0)
 }

@@ -3,7 +3,6 @@ package outboundgroup
 import (
 	"context"
 	"errors"
-	"net"
 	"os"
 	"sync"
 	"time"
@@ -192,11 +191,13 @@ func (c *watchedConn) refused(err error) {
 	}
 }
 
-// localEnd reports whether err is the local side ending the read.
+// localEnd reports whether err is the local side ending the read: a deadline
+// it let pass. A connection it closed is settled before it is closed (Close),
+// whatever error the read then gets; net.ErrClosed without that is the far
+// side ending the stream, as some transports report it.
 func localEnd(err error) bool {
 	var timeout interface{ Timeout() bool }
-	return errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) ||
-		errors.As(err, &timeout) && timeout.Timeout()
+	return errors.Is(err, os.ErrDeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // written follows a write: a request that went out whole is waited on, a
@@ -251,6 +252,8 @@ func (c *watchedConn) ReadBuffer(buffer *buf.Buffer) (err error) {
 	return
 }
 
+// Close settles the watch before the connection is closed: the error the
+// close gives a pending read is then never counted.
 func (c *watchedConn) Close() error {
 	c.settle(false)
 	return c.Conn.Close()
