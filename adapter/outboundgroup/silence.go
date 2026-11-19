@@ -417,8 +417,19 @@ const (
 // meanwhile.
 func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	s := &gb.silence
+	// A check that found the node alive changes no mark: what started it and
+	// how long it holds the next one back is told in the log alone, once the
+	// lock is let go.
+	var by string
+	var wait time.Duration
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		if by != "" {
+			log.Debugln("[Проба] %s: проверен из-за %s — отвечает, следующая такая проверка не раньше чем через %d с",
+				p.Name(), by, int(wait.Round(time.Second)/time.Second))
+		}
+	}()
 	s.asking = false
 	now := time.Now()
 	switch s.node {
@@ -448,14 +459,17 @@ func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 		s.quietUntil, s.failedQuietUntil = until, until
 	case v == verdictAlive && !failed && s.byCuts:
 		s.cutQuietUntil = grown(&s.cutPause)
+		by, wait = "оборванных соединений", s.cutQuietUntil.Sub(now)
 	case v == verdictAlive && !failed:
 		s.quietUntil = grown(&s.pause)
+		by, wait = "запросов без ответа", s.quietUntil.Sub(now)
 	case v == verdictAlive:
 		// The node answers while connections through it fail.
 		if s.failedPause == 0 {
 			s.failedPause = silenceAfter
 		}
 		s.failedQuietUntil = now.Add(s.failedPause)
+		by, wait = "неоткрывшихся соединений", s.failedPause
 		if s.failedPause *= 2; s.failedPause > silencePause {
 			s.failedPause = silencePause
 		}
