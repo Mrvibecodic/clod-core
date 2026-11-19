@@ -68,9 +68,24 @@ func TestCutsMixedWithSilenceLeaveThePauseOfASilentSite(t *testing.T) {
 	}
 }
 
-// A check started by silence while the pause of cut connections runs takes
-// the next pause in advance: two checks in two pauses, as there were.
-func TestACheckBySilenceDuringThePauseOfCutsTakesTheNextPause(t *testing.T) {
+// expire ends the pause of a silent site, as if it had run out.
+func expire(gb *GroupBase) {
+	gb.silence.mu.Lock()
+	gb.silence.quietUntil = time.Now().Add(-time.Millisecond)
+	gb.silence.mu.Unlock()
+}
+
+func within(t *testing.T, what string, until time.Time, want time.Duration) {
+	t.Helper()
+	if got := time.Until(until); got < want-time.Second || got > want+time.Second {
+		t.Fatalf("%s ends %s from now, want %s", what, got.Round(time.Second), want)
+	}
+}
+
+// A check started by silence while the pause of cut connections runs leaves
+// the pause of a silent site from its own end, and leaves the pause of cut
+// connections where it was: both hold back what they hold back.
+func TestACheckBySilenceDuringThePauseOfCutsTakesThePauseOfASilentSite(t *testing.T) {
 	gb, node, asks := cutGroup()
 	cuts(gb, node, asks, silenceCount)
 	gb.asked(node, verdictAlive, false)
@@ -79,12 +94,115 @@ func TestACheckBySilenceDuringThePauseOfCutsTakesTheNextPause(t *testing.T) {
 	asks.want(t, 2)
 	gb.asked(node, verdictAlive, false)
 	quiet, cut := windows(gb)
-	if want := cutUntil.Add(2 * silencePause); quiet.Before(want.Add(-time.Second)) || !cut.Equal(quiet) {
-		t.Fatalf("the pauses end %s and %s from now, want both %s", time.Until(quiet), time.Until(cut), time.Until(want))
+	within(t, "the pause of a silent site", quiet, silencePause)
+	if !cut.Equal(cutUntil) {
+		t.Fatalf("the pause of cuts moved by %s", cut.Sub(cutUntil))
 	}
 	silent(gb, node, asks, silenceCount)
 	cuts(gb, node, asks, silenceCount)
 	asks.want(t, 2)
+}
+
+// A node that goes silent right after a check of cut connections and a
+// check of its silence is asked about again one pause later, not after the
+// pause of cuts and a doubled pause on top of it.
+func TestASilenceCheckInThePauseOfCutsWaitsOnePauseFromItsEnd(t *testing.T) {
+	gb, node, asks := cutGroup()
+	cuts(gb, node, asks, silenceCount)
+	asks.want(t, 1)
+	gb.asked(node, verdictAlive, false)
+	silent(gb, node, asks, silenceCount)
+	asks.want(t, 2)
+	gb.asked(node, verdictAlive, false)
+	quiet, _ := windows(gb)
+	within(t, "the pause of a silent site", quiet, silencePause)
+}
+
+// Nor does the pause of a silent site wait for the pause of cuts to end.
+func TestASilenceCheckInThePauseOfCutsDoesNotWaitForItsEnd(t *testing.T) {
+	gb, node, asks := cutGroup()
+	cuts(gb, node, asks, silenceCount)
+	gb.asked(node, verdictAlive, false)
+	silent(gb, node, asks, silenceCount)
+	asks.want(t, 2)
+	gb.asked(node, verdictAlive, false)
+	quiet, _ := windows(gb)
+	if got := time.Until(quiet); got > 2*silencePause+time.Second {
+		t.Fatalf("the pause of a silent site ends %s from now, past %s", got.Round(time.Second), 2*silencePause)
+	}
+}
+
+// The two pauses grow each with its own checks: checks of silence after a
+// check of cuts leave 30 and 60 seconds, as without it.
+func TestThePausesOfCutsAndOfSilenceGrowApart(t *testing.T) {
+	gb, node, asks := cutGroup()
+	cuts(gb, node, asks, silenceCount)
+	gb.asked(node, verdictAlive, false)
+	_, cut := windows(gb)
+	within(t, "the pause of cuts", cut, silencePause)
+	silent(gb, node, asks, silenceCount)
+	gb.asked(node, verdictAlive, false)
+	quiet, _ := windows(gb)
+	within(t, "the first pause of a silent site", quiet, silencePause)
+	expire(gb)
+	silent(gb, node, asks, silenceCount)
+	asks.want(t, 3)
+	gb.asked(node, verdictAlive, false)
+	quiet, after := windows(gb)
+	within(t, "the second pause of a silent site", quiet, 2*silencePause)
+	if !after.Equal(cut) {
+		t.Fatalf("the pause of cuts moved by %s", after.Sub(cut))
+	}
+}
+
+// An answer through the node starts both pauses anew.
+func TestAnAnswerStartsBothPausesAnew(t *testing.T) {
+	gb, node, asks := cutGroup()
+	cuts(gb, node, asks, silenceCount)
+	gb.asked(node, verdictAlive, false)
+	silent(gb, node, asks, silenceCount)
+	gb.asked(node, verdictAlive, false)
+	gb.noteAnswer(node, born)
+	gb.silence.mu.Lock()
+	gb.silence.answeredAt = time.Now().Add(-silenceAfter - time.Second)
+	gb.silence.quietUntil, gb.silence.cutQuietUntil = time.Time{}, time.Time{}
+	gb.silence.mu.Unlock()
+	cuts(gb, node, asks, silenceCount)
+	asks.want(t, 3)
+	gb.asked(node, verdictAlive, false)
+	_, cut := windows(gb)
+	within(t, "the pause of cuts after an answer", cut, silencePause)
+	silent(gb, node, asks, silenceCount)
+	asks.want(t, 4)
+	gb.asked(node, verdictAlive, false)
+	quiet, _ := windows(gb)
+	within(t, "the pause of a silent site after an answer", quiet, silencePause)
+}
+
+// Cut connections alone grow their pause 30, 60, 120 seconds and leave no
+// pause of a silent site; a node found dead starts it anew.
+func TestThePauseOfCutsGrowsAlone(t *testing.T) {
+	gb, node, asks := cutGroup()
+	for i, want := range []time.Duration{silencePause, 2 * silencePause, silencePauseMax, silencePauseMax} {
+		cuts(gb, node, asks, silenceCount)
+		asks.want(t, int32(i+1))
+		gb.asked(node, verdictAlive, false)
+		quiet, cut := windows(gb)
+		within(t, "the pause of cuts", cut, want)
+		if !quiet.IsZero() {
+			t.Fatalf("cut connections left a pause of a silent site of %s", time.Until(quiet))
+		}
+		gb.silence.mu.Lock()
+		gb.silence.cutQuietUntil = time.Now()
+		gb.silence.mu.Unlock()
+	}
+	cuts(gb, node, asks, silenceCount)
+	gb.asked(node, verdictDead, false)
+	cuts(gb, node, asks, silenceCount)
+	asks.want(t, 6)
+	gb.asked(node, verdictAlive, false)
+	_, cut := windows(gb)
+	within(t, "the pause of cuts after a dead node", cut, silencePause)
 }
 
 // The pause of cut connections takes nothing off the pause of a silent site,

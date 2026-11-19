@@ -63,11 +63,12 @@ type silence struct {
 	// opposed to being cut. A check started by cut connections alone (byCuts)
 	// that finds the node alive holds back cut connections only, until
 	// cutQuietUntil: they were the server refusing sites, and they say
-	// nothing of whether the node goes silent after. A check started by
-	// silence while that pause runs (early) takes the next pause in advance,
-	// so the node is asked about no more often than before.
+	// nothing of whether the node goes silent after. That pause grows with
+	// its own checks (cutPause), so it neither lengthens the pause of a
+	// silent site nor is lengthened by it.
 	timed         int
-	byCuts, early bool
+	byCuts        bool
+	cutPause      time.Duration
 	cutQuietUntil time.Time
 }
 
@@ -83,7 +84,7 @@ func (s *silence) follows(p C.Proxy, born time.Time) bool {
 	// What was found out of the node before says nothing of this one.
 	s.node, s.since, s.count, s.answeredAt = p, born, 0, time.Time{}
 	s.pause, s.failedPause, s.quietUntil, s.failedQuietUntil, s.noNetwork = 0, 0, time.Time{}, time.Time{}, false
-	s.timed, s.cutQuietUntil = 0, time.Time{}
+	s.timed, s.cutPause, s.cutQuietUntil = 0, 0, time.Time{}
 	return true
 }
 
@@ -311,7 +312,7 @@ func (gb *GroupBase) noteAnswer(p C.Proxy, born time.Time) {
 	s := &gb.silence
 	s.mu.Lock()
 	if s.follows(p, born) {
-		s.answeredAt, s.count, s.timed, s.pause, s.failedPause = time.Now(), 0, 0, 0, 0
+		s.answeredAt, s.count, s.timed, s.pause, s.failedPause, s.cutPause = time.Now(), 0, 0, 0, 0, 0
 		if s.noNetwork {
 			s.noNetwork, s.quietUntil, s.failedQuietUntil = false, time.Time{}, time.Time{}
 		}
@@ -371,7 +372,7 @@ func (gb *GroupBase) note(p C.Proxy, born, sent time.Time, ask func(), cut bool)
 	}
 	start := s.count >= silenceCount && !s.asking && !now.Before(s.quietUntil)
 	if start {
-		s.byCuts, s.early = s.timed == 0, now.Before(s.cutQuietUntil)
+		s.byCuts = s.timed == 0
 		s.count, s.timed, s.asking = 0, 0, true
 	}
 	s.mu.Unlock()
@@ -405,8 +406,8 @@ const (
 //     ask again.
 //
 // A check that cut connections alone started, and that found the node alive,
-// holds back cut connections only: silence is still counted, and a check it
-// starts meanwhile takes the next pause in advance.
+// holds back cut connections only, for a pause of their own: silence is still
+// counted, and the pause a check of it leaves starts when that check ends.
 //
 // A check that found nothing out leaves a short wait and makes none longer.
 // What was found out of p says nothing of the node the group has gone to
@@ -424,13 +425,13 @@ func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	default:
 		return
 	}
-	grown := func(from time.Time) time.Time {
-		if s.pause == 0 {
-			s.pause = silencePause
+	grown := func(pause *time.Duration) time.Time {
+		if *pause == 0 {
+			*pause = silencePause
 		}
-		until := from.Add(s.pause)
-		if s.pause *= 2; s.pause > silencePauseMax {
-			s.pause = silencePauseMax
+		until := now.Add(*pause)
+		if *pause *= 2; *pause > silencePauseMax {
+			*pause = silencePauseMax
 		}
 		return until
 	}
@@ -438,23 +439,14 @@ func (gb *GroupBase) asked(p C.Proxy, v verdict, failed bool) {
 	switch {
 	case v == verdictDead:
 		s.pause, s.failedPause, s.quietUntil, s.failedQuietUntil = 0, 0, time.Time{}, time.Time{}
-		s.cutQuietUntil = time.Time{}
+		s.cutPause, s.cutQuietUntil = 0, time.Time{}
 	case v == verdictNoNetwork:
-		until := grown(now)
+		until := grown(&s.pause)
 		s.quietUntil, s.failedQuietUntil = until, until
 	case v == verdictAlive && !failed && s.byCuts:
-		s.cutQuietUntil = grown(now)
-	case v == verdictAlive && !failed && s.early:
-		// The pause after this check follows the one the cut connections
-		// left: two checks in two pauses, as there were.
-		from := s.cutQuietUntil
-		if from.Before(now) {
-			from = now
-		}
-		s.quietUntil = grown(from)
-		s.cutQuietUntil = s.quietUntil
+		s.cutQuietUntil = grown(&s.cutPause)
 	case v == verdictAlive && !failed:
-		s.quietUntil = grown(now)
+		s.quietUntil = grown(&s.pause)
 	case v == verdictAlive:
 		// The node answers while connections through it fail.
 		if s.failedPause == 0 {
@@ -679,7 +671,7 @@ func (gb *GroupBase) failedOf(p C.Proxy, born time.Time, d doubt) {
 	s.mu.Lock()
 	start := s.follows(p, born) && !s.asking && !time.Now().Before(s.failedQuietUntil)
 	if start {
-		s.asking, s.byCuts, s.early = true, false, false
+		s.asking, s.byCuts = true, false
 	}
 	s.mu.Unlock()
 	if start {
