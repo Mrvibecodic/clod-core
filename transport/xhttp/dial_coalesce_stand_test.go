@@ -149,7 +149,7 @@ func standServer(t *testing.T, mode string) string {
 }
 
 // standClient собирает клиента XHTTP так же, как vless.go. wrap, если задан,
-// оборачивает фабрику транспорта снаружи, как это делает xhttp_flow.
+// оборачивает фабрику транспорта снаружи.
 func standClient(t *testing.T, addr, mode string, reuse *ReuseConfig, wrap func(TransportMaker) TransportMaker) *Client {
 	t.Helper()
 	var mk TransportMaker = func() http.RoundTripper {
@@ -267,7 +267,7 @@ func TestCoalesceDialsStandModes(t *testing.T) {
 	}
 }
 
-// Внешняя обёртка подменяет DialTLSContext до склейки, как xhttp_flow:
+// Внешняя обёртка подменяет DialTLSContext до склейки:
 // склейка работает поверх неё, и каждое соединение проходит через обёртку.
 func TestCoalesceDialsStandWrappedDial(t *testing.T) {
 	leakCheck(t)
@@ -303,7 +303,7 @@ func TestCoalesceDialsStandWrappedDial(t *testing.T) {
 
 // Блокировка после ClientHello на холодном пуле: живые соединения оборваны,
 // новые висят. Две волны сессий не открывают больше двух сокетов на
-// транспорт (ведущий и запасной: история у клиента после прогрева уже есть)
+// транспорт (ведущий и, если TCP не поднялся за coalescedBackupAfter, запасной)
 // и не оставляют их висеть; после снятия блокировки сессии сразу идут.
 func TestCoalesceDialsStandBlackhole(t *testing.T) {
 	leakCheck(t)

@@ -3,11 +3,15 @@ package xhttp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/metacubex/mihomo/common/httputils"
 
 	"github.com/metacubex/http"
 )
@@ -368,65 +372,391 @@ func helloCounter(t *testing.T, addr string, delay time.Duration, hellos *atomic
 	return ln.Addr().String()
 }
 
+func setSpareIdle(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := coalescedSpareIdle
+	coalescedSpareIdle = d
+	t.Cleanup(func() { coalescedSpareIdle = old })
+}
+
+// slowTCPFactory — фабрика, у которой TCP ставится 300 мс, а запасной dial
+// начинается через 50: до TCP доходят оба, и оба проходят рукопожатие.
+func slowTCPFactory(t *testing.T, d *dialCounter, handler http.HandlerFunc, hellos *atomic.Int64) TransportMaker {
+	t.Helper()
+	setBackupAfter(t, 50*time.Millisecond)
+	addr := helloCounter(t, h2TestServer(t, 0, handler), 300*time.Millisecond, hellos)
+	return dialFactory(t, d, func(int64) string { return addr }, func(int64) time.Duration { return 300 * time.Millisecond }, nil)
+}
+
+func okHandler(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }
+
 // TCP устанавливается дольше coalescedBackupAfter (DNS на первом dial'е,
-// dialer-proxy, большой RTT), и запасной dial тоже до него доходит. Дальше
-// идёт только тот, кто дошёл первым: рукопожатие к серверу одно.
-func TestCoalesceDialsOneHandshakeAfterSlowTCP(t *testing.T) {
+// dialer-proxy, большой RTT), и запасной dial тоже до него доходит. Как у
+// браузера, оба проходят рукопожатие; запросы идут по одному соединению, а
+// второе простаивает coalescedSpareIdle и закрывается. Рабочее остаётся.
+func TestCoalesceDialsSpareHandshakeAfterSlowTCP(t *testing.T) {
+	setSpareIdle(t, time.Second)
+	var mu sync.Mutex
+	served := map[string]struct{}{}
 	var hellos atomic.Int64
-	addr := helloCounter(t, okServer(t), 300*time.Millisecond, &hellos)
 	var d dialCounter
-	mk := dialFactory(t, &d, func(int64) string { return addr }, func(int64) time.Duration { return 300 * time.Millisecond }, nil)
-	failed, _ := burst(mk(), 30, 5*time.Second)
-	if failed != 0 {
+	rt := slowTCPFactory(t, &d, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		served[r.RemoteAddr] = struct{}{}
+		mu.Unlock()
+		w.Write([]byte("ok"))
+	}, &hellos)()
+	if failed, _ := burst(rt, 30, 5*time.Second); failed != 0 {
 		t.Fatalf("%d of 30 requests failed", failed)
+	}
+	waitFor(t, "the handshake of the second dial", 3*time.Second, func() bool { return hellos.Load() == 2 })
+	// Рукопожатие второго ещё идёт или его соединение уже простаивает: оно
+	// открыто, а не оборвано.
+	time.Sleep(500 * time.Millisecond)
+	if got := d.open.Load(); got != 2 {
+		t.Fatalf("%d conns open while the second one idles, want 2", got)
+	}
+	if failed, _ := burst(rt, 30, 5*time.Second); failed != 0 {
+		t.Fatalf("%d of 30 requests failed with the second conn idle", failed)
+	}
+	waitFor(t, "the idle conn to close", 3*time.Second, func() bool { return d.open.Load() == 1 })
+	time.Sleep(200 * time.Millisecond)
+	if err := roundTrip(rt, context.Background()); err != nil {
+		t.Fatalf("request after the idle conn closed: %v", err)
+	}
+	if got := d.open.Load(); got != 1 {
+		t.Fatalf("%d conns open after the idle one closed, want the working one", got)
 	}
 	if got := d.dials.Load(); got != 2 {
 		t.Fatalf("%d dials, want the leader and its backup", got)
 	}
-	if got := hellos.Load(); got != 1 {
-		t.Fatalf("%d handshakes reached the server, want 1", got)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(served) != 1 {
+		t.Fatalf("requests went over %d conns, want 1", len(served))
 	}
 }
 
-// XHTTP без TLS: wrapTLS возвращает соединение как есть, ничего не записав,
-// и dial, уступивший TCP другому, возвращается без ошибки. Он приходит первым
-// (ведущий ещё не вернулся), но попытка отдаёт соединение ведущего, а не
-// закрытое соединение уступившего.
-func TestCoalesceDialsBackupLostTCPWithoutTLS(t *testing.T) {
-	var n atomic.Int64
-	var leaderConn net.Conn
-	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
-		c, peer := net.Pipe()
-		t.Cleanup(func() { c.Close(); peer.Close() })
-		switch n.Add(1) {
-		case 1:
-			// Ведущий: TCP за 300 мс, раньше запасного, а вернётся через
-			// 100 мс после этого.
-			time.Sleep(300 * time.Millisecond)
-			w := DialTCPUp(ctx, c)
-			leaderConn = w
-			time.Sleep(100 * time.Millisecond)
-			return w, nil
-		default:
-			// Запасной: начат через coalescedBackupAfter, TCP вторым,
-			// возвращается сразу, как без TLS.
-			time.Sleep(100 * time.Millisecond)
-			return DialTCPUp(ctx, c), nil
+// На транспорт простаивает не больше одного соединения: новое закрывает
+// прежнее, и частые холодные dial'ы на медленном канале их не копят.
+func TestCoalesceDialsOneSpareForTransport(t *testing.T) {
+	var hellos atomic.Int64
+	var d dialCounter
+	rt := slowTCPFactory(t, &d, okHandler, &hellos)()
+	for i := int64(1); i <= 3; i++ {
+		if failed, _ := burst(rt, 4, 5*time.Second); failed != 0 {
+			t.Fatalf("round %d: %d of 4 requests failed", i, failed)
 		}
+		waitFor(t, "the handshake of the second dial", 3*time.Second, func() bool { return hellos.Load() == 2*i })
+		// Рабочее соединение и одно простаивающее.
+		waitFor(t, "the older idle conn to close", 3*time.Second, func() bool { return d.open.Load() == 2 })
+		time.Sleep(300 * time.Millisecond)
+		if got := d.open.Load(); got != 2 {
+			t.Fatalf("round %d: %d conns open, want the working one and one idle", i, got)
+		}
+		// Рабочее соединение пропало, простаивающее остаётся.
+		rt.(*coalescingTransport).Transport.CloseIdleConnections()
+		rt.(*coalescingTransport).Transport.CloseHttp2Connections()
+		waitFor(t, "the working conn to close", 3*time.Second, func() bool { return d.open.Load() == 1 })
 	}
-	a := &dialAttempt{start: time.Now(), tcpUp: make(chan struct{})}
-	conn, err := dialWithBackup(context.Background(), a, dial, "tcp", "x")
+}
+
+// noteConn сообщает, что его закрыли.
+type noteConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func newNoteConn(t *testing.T) (*noteConn, net.Conn) {
+	c, peer := net.Pipe()
+	t.Cleanup(func() { c.Close(); peer.Close() })
+	return &noteConn{Conn: c, closed: make(chan struct{})}, peer
+}
+
+func (c *noteConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func (c *noteConn) closedWithin(d time.Duration) bool {
+	select {
+	case <-c.closed:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+func (c *noteConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// spareAttempt — попытка и её контекст, как их собирает lead.
+func spareAttempt(ctx context.Context, stop <-chan struct{}) (*dialAttempt, context.Context) {
+	a := newDialAttempt(stop, nil)
+	return a, context.WithValue(ctx, dialAttemptKey{}, a)
+}
+
+// spareDials — два dial'а попытки на net.Pipe, как XHTTP без TLS, при запасном
+// через 50 мс: ведущий поднимает TCP на 300-й мс и возвращается на 500-й,
+// запасной возвращается на 150-й. peer — другой конец соединения ведущего.
+func spareDials(t *testing.T) (dial func(context.Context, string, string) (net.Conn, error), leader, backup *noteConn, peer net.Conn) {
+	setBackupAfter(t, 50*time.Millisecond)
+	var n atomic.Int64
+	leader, peer = newNoteConn(t)
+	backup, _ = newNoteConn(t)
+	dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if n.Add(1) == 1 {
+			time.Sleep(300 * time.Millisecond)
+			c := DialTCPUp(ctx, leader)
+			time.Sleep(200 * time.Millisecond)
+			return c, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+		return DialTCPUp(ctx, backup), nil
+	}
+	return dial, leader, backup, peer
+}
+
+// XHTTP без TLS: оба dial'а попытки возвращаются удачно. Попытка отдаёт
+// соединение того, кто вернулся первым, а соединение другого не достаётся
+// net/http, не закрывается сразу и закрывается через coalescedSpareIdle.
+func TestCoalesceDialsSpareWithoutTLS(t *testing.T) {
+	setSpareIdle(t, 700*time.Millisecond)
+	dial, leader, backup, _ := spareDials(t)
+	a, ctx := spareAttempt(context.Background(), nil)
+	conn, err := dialWithBackup(ctx, a, dial, "tcp", "x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, lost := conn.(secondConn); lost {
-		t.Fatal("the attempt returned the closed conn of the dial that lost TCP")
+	if c, ok := conn.(*countingConn); !ok || c.Conn != net.Conn(backup) {
+		t.Fatalf("the attempt returned %T, want the conn of the dial that returned first", conn)
 	}
-	if conn != leaderConn {
-		t.Fatalf("the attempt returned %T, want the leader's conn", conn)
+	// Ведущий вернётся через 350 мс и простоит ещё 700.
+	if leader.closedWithin(700 * time.Millisecond) {
+		t.Fatal("the conn of the other dial was closed at once")
 	}
-	if got := n.Load(); got != 2 {
-		t.Fatalf("%d dials, want the leader and its backup", got)
+	if !leader.closedWithin(2 * time.Second) {
+		t.Fatal("the conn of the other dial was not closed after coalescedSpareIdle")
+	}
+	if backup.isClosed() {
+		t.Fatal("the conn the attempt returned was closed")
+	}
+}
+
+// Сервер закрывает простаивающее соединение раньше срока: оно закрывается в
+// ответ, не дожидаясь coalescedSpareIdle.
+func TestCoalesceDialsSpareClosedByServer(t *testing.T) {
+	dial, leader, _, peer := spareDials(t)
+	a, ctx := spareAttempt(context.Background(), nil)
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if leader.closedWithin(600 * time.Millisecond) {
+		t.Fatal("the conn of the other dial was closed at once")
+	}
+	_ = peer.Close()
+	if !leader.closedWithin(2 * time.Second) {
+		t.Fatal("the idle conn outlived the server's close")
+	}
+}
+
+// Контекст попытки отменён, когда один dial уже отдал соединение (обрыв,
+// успевший до конца попытки, или закрытие транспорта, пока net/http ещё не
+// принял соединение): простаивающее соединение другого закрывается.
+func TestCoalesceDialsSpareClosedWithAttempt(t *testing.T) {
+	dial, leader, _, _ := spareDials(t)
+	parent, abort := context.WithCancel(context.Background())
+	defer abort()
+	a, ctx := spareAttempt(parent, nil)
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if leader.closedWithin(600 * time.Millisecond) {
+		t.Fatal("the conn of the other dial was closed at once")
+	}
+	abort()
+	if !leader.closedWithin(2 * time.Second) {
+		t.Fatal("the idle conn outlived its attempt")
+	}
+}
+
+// Транспорт закрывает соединения (клиент закрыт, соединение отставлено, сеть
+// сменилась): простаивающее вне пула net/http закрывается тоже, а транспорт
+// остаётся рабочим, и следующее закрытие закрывает следующее простаивающее.
+func TestCoalesceDialsSpareClosedWithTransport(t *testing.T) {
+	var hellos atomic.Int64
+	var d dialCounter
+	rt := slowTCPFactory(t, &d, okHandler, &hellos)()
+	for i := int64(1); i <= 2; i++ {
+		if failed, _ := burst(rt, 8, 5*time.Second); failed != 0 {
+			t.Fatalf("round %d: %d of 8 requests failed", i, failed)
+		}
+		waitFor(t, "the handshake of the second dial", 3*time.Second, func() bool { return hellos.Load() == 2*i })
+		time.Sleep(500 * time.Millisecond)
+		if got := d.open.Load(); got != 2 {
+			t.Fatalf("round %d: %d conns open while the second one idles, want 2", i, got)
+		}
+		httputils.CloseTransport(rt)
+		waitFor(t, "both conns to close with the transport", 2*time.Second, func() bool { return d.open.Load() == 0 })
+	}
+}
+
+// Транспорт закрыт, пока другой dial попытки не вернулся: начатое рукопожатие
+// не обрывается на полпути, а его соединение закрывается сразу, как готово.
+func TestCoalesceDialsSpareDialOutlivesTransportClose(t *testing.T) {
+	setBackupAfter(t, 50*time.Millisecond)
+	leader, _ := newNoteConn(t)
+	backup, _ := newNoteConn(t)
+	var n atomic.Int64
+	var cut atomic.Bool
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if n.Add(1) == 1 {
+			select {
+			case <-ctx.Done():
+				cut.Store(true)
+				return nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+				return leader, nil
+			}
+		}
+		return backup, nil
+	}
+	stop := make(chan struct{})
+	close(stop)
+	a, ctx := spareAttempt(context.Background(), stop)
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if !leader.closedWithin(2 * time.Second) {
+		t.Fatal("the conn of the other dial was left open after the transport closed")
+	}
+	if cut.Load() {
+		t.Fatal("the other dial was cut in mid-handshake")
+	}
+	if backup.isClosed() {
+		t.Fatal("the conn the attempt returned was closed")
+	}
+}
+
+// Другой dial попытки не дозвонился к её сроку (coalescedDialTimeout от
+// начала попытки): он обрывается тогда, а не в момент, когда первый отдал
+// соединение. Соединение, которое он всё же вернул, закрывается.
+func TestCoalesceDialsSpareDialBoundedByAttempt(t *testing.T) {
+	setDialTimeout(t, time.Second)
+	setBackupAfter(t, 50*time.Millisecond)
+	late, _ := newNoteConn(t)
+	backup, _ := newNoteConn(t)
+	var n atomic.Int64
+	cancelled := make(chan time.Duration, 1)
+	start := time.Now()
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if n.Add(1) == 1 {
+			<-ctx.Done()
+			cancelled <- time.Since(start)
+			return late, nil
+		}
+		return backup, nil
+	}
+	a, ctx := spareAttempt(context.Background(), nil)
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case took := <-cancelled:
+		if took < 900*time.Millisecond {
+			t.Fatalf("the other dial was cut %v into the attempt, want it to run to the attempt's bound", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the other dial was never cut")
+	}
+	if !late.closedWithin(time.Second) {
+		t.Fatal("the conn returned after the cut was left open")
+	}
+}
+
+// Попытку оборвали, пока другой dial ещё идёт: он обрывается сразу, а не по
+// сроку попытки.
+func TestCoalesceDialsSpareDialCutWithAttempt(t *testing.T) {
+	setBackupAfter(t, 50*time.Millisecond)
+	backup, _ := newNoteConn(t)
+	var n atomic.Int64
+	cut := make(chan struct{})
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if n.Add(1) == 1 {
+			<-ctx.Done()
+			close(cut)
+			return nil, ctx.Err()
+		}
+		return backup, nil
+	}
+	parent, abort := context.WithCancel(context.Background())
+	defer abort()
+	a, ctx := spareAttempt(parent, nil)
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cut:
+		t.Fatal("the other dial was cut although its attempt goes on")
+	case <-time.After(300 * time.Millisecond):
+	}
+	abort()
+	select {
+	case <-cut:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the other dial outlived its attempt")
+	}
+}
+
+// Попытку оборвали раньше срока запасного: запасной не начинается.
+func TestCoalesceDialsNoBackupForCutAttempt(t *testing.T) {
+	setBackupAfter(t, 100*time.Millisecond)
+	var n atomic.Int64
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		n.Add(1)
+		time.Sleep(400 * time.Millisecond)
+		return nil, ctx.Err()
+	}
+	parent, abort := context.WithCancel(context.Background())
+	a, ctx := spareAttempt(parent, nil)
+	abort()
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err == nil {
+		t.Fatal("a cut attempt returned a conn")
+	}
+	if got := n.Load(); got != 1 {
+		t.Fatalf("%d dials, want one: the attempt was cut before its backup was due", got)
+	}
+}
+
+// Ведущий отказал уже после того, как начался запасной: попытка отдаёт
+// соединение запасного.
+func TestCoalesceDialsBackupWinsAfterLeaderFails(t *testing.T) {
+	setBackupAfter(t, 50*time.Millisecond)
+	backup, _ := newNoteConn(t)
+	var n atomic.Int64
+	refused := errors.New("refused")
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if n.Add(1) == 1 {
+			time.Sleep(300 * time.Millisecond)
+			return nil, refused
+		}
+		time.Sleep(350 * time.Millisecond)
+		return backup, nil
+	}
+	a, ctx := spareAttempt(context.Background(), nil)
+	conn, err := dialWithBackup(ctx, a, dial, "tcp", "x")
+	if err != nil {
+		t.Fatalf("the attempt failed with %v while its backup dial succeeded", err)
+	}
+	if conn != net.Conn(backup) || backup.isClosed() {
+		t.Fatalf("the attempt returned %T (closed %v), want the backup's open conn", conn, backup.isClosed())
 	}
 }
 
