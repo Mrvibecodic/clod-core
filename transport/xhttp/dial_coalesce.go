@@ -66,7 +66,7 @@ import (
 const coalescedDialRetry = 250 * time.Millisecond
 
 // coalescedAttemptTimeout — сколько попытка ведущего ждёт ответа сервера после
-// установленного TCP, прежде чем её заменит следующая. net/http дозванивается
+// первой записи в соединение, прежде чем её заменит следующая. net/http дозванивается
 // в контексте, отвязанном от отмены запроса, а рукопожатие на этом пути срока
 // не имеет: повисшее после ClientHello держало бы всех ждущих до таймаута TCP.
 // Срок — это и простой транспорта на одном зависшем рукопожатии (блокировка,
@@ -75,13 +75,15 @@ const coalescedDialRetry = 250 * time.Millisecond
 // tunnel (C.DefaultTCPTimeout, 5 с), чтобы залп, начавший зависшую попытку,
 // успел дозвониться следующей. Попытка заменяется, а не идёт параллельно, и
 // медленный живой канал срезался бы на одном и том же месте, поэтому срок
-// отсчитывается от установленного TCP (DNS, dialer-proxy и сам TCP в него не
-// входят), не меньше трёх времён до установленного TCP этой попытки и
+// отсчитывается от первой записи в установленное соединение (DNS,
+// dialer-proxy, сам TCP и то, что обёртка делает до ClientHello, в него не
+// входят: пока серверу ничего не отправлено, его тишина ничего не значит),
+// не меньше трёх времён до установленного TCP этой попытки и
 // продлевается на столько же, пока от сервера идут байты: блокировка после
 // ClientHello — это тишина, а медленный канал присылает ServerHello. Всё
 // вместе не дольше coalescedDialTimeout. С TCP Fast Open dialRaw возвращается
 // до ответа сервера: время до TCP выходит около нуля, срок — ровно
-// coalescedAttemptTimeout от начала, и запасного dial'а нет, а потерянный SYN
+// coalescedAttemptTimeout от первой записи, и запасного dial'а нет, а потерянный SYN
 // уходит в продление по байтам или в следующую попытку.
 var coalescedAttemptTimeout = 2 * time.Second
 
@@ -116,12 +118,14 @@ type dialAttempt struct {
 	read   atomic.Int64 // сколько байтов прислал сервер
 	ended  atomic.Bool  // попытка закончилась: считать больше незачем
 
-	stop <-chan struct{} // закрыт, когда транспорт закрывает свои соединения
-	slot *spareSlot
+	stop      <-chan struct{} // закрыт, когда транспорт закрывает свои соединения
+	slot      *spareSlot
+	wrote     chan struct{} // закрыт первой записью в соединение попытки
+	wroteOnce sync.Once
 }
 
 func newDialAttempt(stop <-chan struct{}, slot *spareSlot) *dialAttempt {
-	return &dialAttempt{start: time.Now(), tcpUp: make(chan struct{}), stop: stop, slot: slot}
+	return &dialAttempt{start: time.Now(), tcpUp: make(chan struct{}), stop: stop, slot: slot, wrote: make(chan struct{})}
 }
 
 func (a *dialAttempt) markUp() {
@@ -145,10 +149,10 @@ func DialTCPUp(ctx context.Context, conn net.Conn) net.Conn {
 	return &countingConn{Conn: conn, a: a}
 }
 
-// countingConn считает байты, прочитанные из соединения, пока идёт попытка.
-// Соединение XHTTP живёт часами, поэтому после рукопожатия на чтение остаётся
-// одна проверка флага. Настоящий сокет под ней виден через Upstream(): так
-// его находят обёртки mihomo.
+// countingConn считает байты, прочитанные из соединения, пока идёт попытка, и
+// отмечает первую запись в него. Соединение XHTTP живёт часами, поэтому после
+// рукопожатия на чтение и запись остаётся одна проверка флага. Настоящий
+// сокет под ней виден через Upstream(): так его находят обёртки mihomo.
 type countingConn struct {
 	net.Conn
 	a *dialAttempt
@@ -160,6 +164,13 @@ func (c *countingConn) Read(b []byte) (int, error) {
 		c.a.read.Add(int64(n))
 	}
 	return n, err
+}
+
+func (c *countingConn) Write(b []byte) (int, error) {
+	if !c.a.ended.Load() {
+		c.a.wroteOnce.Do(func() { close(c.a.wrote) })
+	}
+	return c.Conn.Write(b)
 }
 
 func (c *countingConn) Upstream() any { return c.Conn }
@@ -444,8 +455,8 @@ func (c *coalescingTransport) lead(ctx context.Context, l *leaderDial, rt *dialR
 }
 
 // watchAttempt обрывает попытку a, которая повисла: TCP не установлен за
-// tcpTimeout (coalescedTCPTimeout) или сервер молчит дольше срока
-// рукопожатия (coalescedAttemptTimeout, его даёт attemptTimeout). Предел
+// tcpTimeout (coalescedTCPTimeout) или сервер молчит после первой записи
+// дольше срока рукопожатия (coalescedAttemptTimeout, его даёт attemptTimeout). Предел
 // coalescedDialTimeout ставит сам guard. Сроки передаются на старте попытки,
 // а не читаются в горутине, как и срок guard'а.
 func watchAttempt(g *guardedDial, a *dialAttempt, tcpTimeout, attemptTimeout time.Duration, done <-chan struct{}) {
@@ -468,6 +479,11 @@ func watchAttempt(g *guardedDial, a *dialAttempt, tcpTimeout, attemptTimeout tim
 		return
 	case <-done:
 		tcp.Stop()
+		return
+	}
+	select {
+	case <-a.wrote:
+	case <-done:
 		return
 	}
 	bound := attemptTimeout
