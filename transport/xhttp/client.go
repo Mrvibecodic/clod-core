@@ -213,6 +213,7 @@ func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFun
 			if err != nil {
 				return nil, err
 			}
+			raw = DialTCPUp(ctx, raw)
 			wrapped, err := wrapTLS(ctx, raw, true)
 			if err != nil {
 				_ = raw.Close()
