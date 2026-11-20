@@ -378,6 +378,7 @@ type dialResult struct {
 }
 
 func parseAddr(ctx context.Context, network, address string, preferResolver resolver.Resolver) ([]netip.Addr, string, error) {
+	defer Resolving(ctx)()
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, "-1", err

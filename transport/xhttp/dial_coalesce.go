@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/component/dialer"
+
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptrace"
 )
@@ -52,7 +54,7 @@ import (
 //     время. Отказ (сброс, закрытый порт, ошибка TLS) получают все, как в
 //     x/net: на отказывающем пути это один dial, а не по dial'у на ждущего;
 //   - если TCP ведущего не установлен за coalescedBackupAfter, начинается
-//     один запасной dial.
+//     один запасной dial (пока dial ищет адрес, срок отсчитывается заново).
 
 // coalescedDialRetry — сколько ждущий ждёт соединения после того, как ведущий
 // дозвонился и его RoundTrip вернулся, и сколько удачный ведущий держит место.
@@ -102,7 +104,9 @@ var coalescedDialTimeout = 5 * time.Second
 // пока TCP не установлен) и у Firefox (network.http.connection-retry-timeout
 // = 250, отменяется по установленному TCP). Когда TCP поднялся и идёт
 // рукопожатие, второй ClientHello к тому же серверу браузер не шлёт, и
-// запасной здесь тоже не начинается.
+// запасной здесь тоже не начинается. Пока dial ещё ищет адрес сервера,
+// запасной ждал бы тот же ответ DNS и ушёл бы вместе с первым: срок, как у
+// Chrome, отсчитывается заново.
 var coalescedBackupAfter = 250 * time.Millisecond
 
 var errCoalescedDialAbandoned = errors.New("xhttp: coalesced dial abandoned")
@@ -122,6 +126,13 @@ type dialAttempt struct {
 	slot      *spareSlot
 	wrote     chan struct{} // закрыт первой записью в соединение попытки
 	wroteOnce sync.Once
+	resolving atomic.Int32 // dial'ы попытки, которые сейчас ищут адрес сервера
+}
+
+// lookup — для dialer.WithResolving: dial попытки ищет адрес сервера.
+func (a *dialAttempt) lookup() (done func()) {
+	a.resolving.Add(1)
+	return func() { a.resolving.Add(-1) }
 }
 
 func newDialAttempt(stop <-chan struct{}, slot *spareSlot) *dialAttempt {
@@ -618,12 +629,14 @@ wait:
 }
 
 // dialWithBackup дозванивается, а если за coalescedBackupAfter TCP не
-// установлен, начинает один запасной dial. Побеждает первый удачный; другой
+// установлен, а адрес уже найден (пока dial ищет адрес, срок отсчитывается
+// заново), начинает один запасной dial. Побеждает первый удачный; другой
 // идёт до конца, но не дольше срока попытки, и его соединение простаивает
 // (idleSpare). Контекст победителя не отменяется: обёртки соединения могут
 // привязывать к нему время жизни.
 func dialWithBackup(ctx context.Context, a *dialAttempt, dial func(context.Context, string, string) (net.Conn, error), network, addr string) (net.Conn, error) {
-	until, idle := a.start.Add(coalescedDialTimeout), coalescedSpareIdle
+	until, idle, backupAfter := a.start.Add(coalescedDialTimeout), coalescedSpareIdle, coalescedBackupAfter
+	ctx = dialer.WithResolving(ctx, a.lookup)
 	results := make(chan dialResult, 2)
 	var cancels [2]context.CancelFunc
 	start := func(idx int) {
@@ -635,7 +648,7 @@ func dialWithBackup(ctx context.Context, a *dialAttempt, dial func(context.Conte
 		}()
 	}
 	start(0)
-	backup := time.NewTimer(coalescedBackupAfter)
+	backup := time.NewTimer(backupAfter)
 	defer backup.Stop()
 	backupC := backup.C
 	running := 1
@@ -643,13 +656,19 @@ func dialWithBackup(ctx context.Context, a *dialAttempt, dial func(context.Conte
 	for running > 0 {
 		select {
 		case <-backupC:
-			backupC = nil
 			select {
 			case <-a.tcpUp:
+				backupC = nil
 			case <-ctx.Done():
+				backupC = nil
 			default:
-				running++
-				start(1)
+				if a.resolving.Load() > 0 {
+					backup.Reset(backupAfter)
+				} else {
+					backupC = nil
+					running++
+					start(1)
+				}
 			}
 		case r := <-results:
 			running--
