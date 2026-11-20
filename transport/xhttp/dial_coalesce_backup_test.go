@@ -6,14 +6,17 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/metacubex/mihomo/common/httputils"
+	"github.com/metacubex/mihomo/component/dialer"
 
 	"github.com/metacubex/http"
+	"github.com/miekg/dns"
 )
 
 // dialFactory — фабрика h2-транспортов XHTTP одного клиента со склейкой.
@@ -757,6 +760,125 @@ func TestCoalesceDialsBackupWinsAfterLeaderFails(t *testing.T) {
 	}
 	if conn != net.Conn(backup) || backup.isClosed() {
 		t.Fatalf("the attempt returned %T (closed %v), want the backup's open conn", conn, backup.isClosed())
+	}
+}
+
+// Dial ещё ищет адрес сервера, когда вышел срок запасного: запасной ждал бы
+// тот же ответ и ушёл бы вместе с первым, поэтому не начинается.
+func TestCoalesceDialsNoBackupWhileResolving(t *testing.T) {
+	setBackupAfter(t, 50*time.Millisecond)
+	conn, _ := newNoteConn(t)
+	var n atomic.Int64
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		n.Add(1)
+		found := dialer.Resolving(ctx)
+		time.Sleep(300 * time.Millisecond)
+		found()
+		return DialTCPUp(ctx, conn), nil
+	}
+	a, ctx := spareAttempt(context.Background(), nil)
+	if _, err := dialWithBackup(ctx, a, dial, "tcp", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.Load(); got != 1 {
+		t.Fatalf("%d dials, want one: the backup would wait for the same lookup", got)
+	}
+}
+
+// Адрес найден, а TCP не ставится: срок, выпавший на поиск адреса, отсчитан
+// заново, и на следующем запасной начинается.
+func TestCoalesceDialsBackupAfterResolving(t *testing.T) {
+	setBackupAfter(t, 100*time.Millisecond)
+	backup, _ := newNoteConn(t)
+	var n atomic.Int64
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if n.Add(1) == 1 {
+			found := dialer.Resolving(ctx)
+			time.Sleep(150 * time.Millisecond)
+			found()
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return DialTCPUp(ctx, backup), nil
+	}
+	parent, stop := context.WithCancel(context.Background())
+	defer stop()
+	a, ctx := spareAttempt(parent, nil)
+	start := time.Now()
+	conn, err := dialWithBackup(ctx, a, dial, "tcp", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := conn.(*countingConn); !ok || c.Conn != net.Conn(backup) {
+		t.Fatalf("the attempt returned %T, want the backup's conn", conn)
+	}
+	if took := time.Since(start); took < 150*time.Millisecond {
+		t.Fatalf("the backup dial started %v into the attempt, while the first one was still resolving", took)
+	}
+}
+
+// slowResolver отвечает адресом 127.0.0.1 через delay.
+type slowResolver struct{ delay time.Duration }
+
+func (r slowResolver) LookupIP(ctx context.Context, _ string) ([]netip.Addr, error) {
+	select {
+	case <-time.After(r.delay):
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r slowResolver) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
+	return r.LookupIP(ctx, host)
+}
+
+func (slowResolver) LookupIPv6(context.Context, string) ([]netip.Addr, error) {
+	return nil, errors.New("no address")
+}
+
+func (slowResolver) ResolveECH(context.Context, string) ([]byte, error) { return nil, nil }
+
+func (slowResolver) ExchangeContext(context.Context, *dns.Msg) (*dns.Msg, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (slowResolver) Invalid() bool    { return true }
+func (slowResolver) ClearCache()      {}
+func (slowResolver) ResetConnection() {}
+
+// Сервер задан именем, и ответ DNS идёт дольше coalescedBackupAfter: через
+// настоящий dialer холодный залп идёт одним соединением и одним рукопожатием.
+func TestCoalesceDialsSlowLookupOneConn(t *testing.T) {
+	var hellos atomic.Int64
+	_, port, err := net.SplitHostPort(helloCounter(t, okServer(t), 0, &hellos))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d dialCounter
+	rt := CoalesceDials(func() http.RoundTripper {
+		return NewTransport(func(ctx context.Context) (net.Conn, error) {
+			d.dials.Add(1)
+			c, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort("slow.test", port), dialer.WithResolver(slowResolver{600 * time.Millisecond}))
+			if err != nil {
+				return nil, err
+			}
+			return d.track(c), nil
+		}, func(ctx context.Context, c net.Conn, _ bool) (net.Conn, error) {
+			tc := tls.Client(c, &tls.Config{NextProtos: []string{"h2"}, InsecureSkipVerify: true})
+			if err := tc.HandshakeContext(ctx); err != nil {
+				return nil, err
+			}
+			return tc, nil
+		}, nil, nil, 0)
+	})()
+	t.Cleanup(func() { httputils.CloseTransport(rt) })
+	if failed, _ := burst(rt, 8, 5*time.Second); failed != 0 {
+		t.Fatalf("%d of 8 requests failed", failed)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if dials, sent := d.dials.Load(), hellos.Load(); dials != 1 || sent != 1 {
+		t.Fatalf("%d dials and %d handshakes behind a slow lookup, want one of each", dials, sent)
 	}
 }
 
