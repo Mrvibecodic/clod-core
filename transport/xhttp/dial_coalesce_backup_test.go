@@ -760,6 +760,50 @@ func TestCoalesceDialsBackupWinsAfterLeaderFails(t *testing.T) {
 	}
 }
 
+// Обёртка соединения долго занята своим до первой записи (например, ищет
+// ECH-ключи в DNS): пока серверу ничего не отправлено, его тишина попытку не
+// обрывает.
+func TestCoalesceDialsSilenceCountsFromFirstWrite(t *testing.T) {
+	old := coalescedAttemptTimeout
+	coalescedAttemptTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { coalescedAttemptTimeout = old })
+	addr := okServer(t)
+	var d dialCounter
+	mk := dialFactory(t, &d, func(int64) string { return addr }, func(int64) time.Duration { return 0 }, func(int64) time.Duration {
+		return 900 * time.Millisecond
+	})
+	if failed, _ := burst(mk(), 8, 5*time.Second); failed != 0 {
+		t.Fatalf("%d of 8 requests failed", failed)
+	}
+	if got := d.dials.Load(); got != 1 {
+		t.Fatalf("%d dials, want one: nothing was sent while the attempt was cut", got)
+	}
+}
+
+// Обёртка так ничего и не отправила: тишина сервера попытку не обрывает, её
+// обрывает срок попытки целиком, и следующая начинается.
+func TestCoalesceDialsNothingWrittenEndsAtDialTimeout(t *testing.T) {
+	setDialTimeout(t, 500*time.Millisecond)
+	addr := okServer(t)
+	var d dialCounter
+	mk := dialFactory(t, &d, func(int64) string { return addr }, func(int64) time.Duration { return 0 }, func(n int64) time.Duration {
+		if n == 1 {
+			return 5 * time.Second
+		}
+		return 0
+	})
+	start := time.Now()
+	if failed, _ := burst(mk(), 8, 5*time.Second); failed != 0 {
+		t.Fatalf("%d of 8 requests failed", failed)
+	}
+	if took := time.Since(start); took < 500*time.Millisecond || took > 2*time.Second {
+		t.Fatalf("burst took %v, want the first attempt cut at its bound and the next one through", took)
+	}
+	if got := d.dials.Load(); got != 2 {
+		t.Fatalf("%d dials, want the one that wrote nothing and the next", got)
+	}
+}
+
 // Соединение ведущего занято его же долгим запросом (лимит в один поток), а
 // RoundTrip ведущего не вернётся до конца сессии. Запрос, пришедший, пока
 // удачный ведущий держит место, получает от net/http занятое соединение,
