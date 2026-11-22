@@ -306,7 +306,7 @@ func (hc *HealthCheck) checkOne(p C.Proxy, url, uid string, expectedStatus utils
 // roundRetryDelay is how long a round that heard from no node waits before it
 // probes them again: a network that was switching or waking up is back by
 // then, one that is gone is still gone.
-var roundRetryDelay = 10 * time.Second
+var roundRetryDelay = 30 * time.Second
 
 // heldNode is a live node whose probe failed in a round, with what the probe
 // would have written to it.
