@@ -17,6 +17,8 @@ import (
 type deviceNet struct {
 	failing int32
 	dials   atomic.Int32
+	// downUntil: connections hang until then whatever their count.
+	downUntil time.Time
 }
 
 // netNode is a node reached over a deviceNet; a dead one never answers.
@@ -29,7 +31,7 @@ type netNode struct {
 
 func (n *netNode) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	n.dials.Add(1)
-	if n.dead || n.net.dials.Add(1) <= n.net.failing {
+	if n.dead || time.Now().Before(n.net.downUntil) || n.net.dials.Add(1) <= n.net.failing {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -142,6 +144,23 @@ func TestARoundThatHeardFromNoNodeTwiceMarksThemDead(t *testing.T) {
 		}
 		if got := nodes[i].dials.Load(); got != 4 {
 			t.Fatalf("node %d got %d tries, want two in the round and two at the retry", i, got)
+		}
+	}
+}
+
+// A round that starts under the probe hold (a wake-up, a network change)
+// waits for its end: the probes begun under it fail and are set aside, and
+// the round would end having heard from no node.
+func TestARoundStartedUnderTheProbeHoldWaitsForItsEnd(t *testing.T) {
+	end := time.Now().Add(4 * time.Second)
+	C.SetProbeHoldUntil(end)
+	t.Cleanup(func() { C.SetProbeHoldUntil(time.Time{}) })
+	net := &deviceNet{downUntil: end}
+	_, proxies, url := roundOf(t, net, 3)
+	runRoundOf(t, proxies, url)
+	for i, p := range proxies {
+		if history := delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(url)); len(history) != 1 || history[0] == 0 {
+			t.Fatalf("node %d: history %v; want one answer after the hold", i, history)
 		}
 	}
 }

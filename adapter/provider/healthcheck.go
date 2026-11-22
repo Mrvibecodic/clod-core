@@ -171,7 +171,36 @@ func (hc *HealthCheck) check() {
 	close(done)
 }
 
+const roundHoldStep = 250 * time.Millisecond
+
+// roundHoldLimit is the longest a round waits for the probe hold to end: a
+// wake-up or a network change holds probes for seconds, a network that keeps
+// flapping would keep extending the hold.
+var roundHoldLimit = 30 * time.Second
+
+// awaitProbeHold has a round start its probes once the probe hold is over. A
+// probe begun under the hold that fails is set aside as saying nothing, so a
+// round started in the hold's last moments heard only from the nodes queued
+// past its end and judged the network by them alone.
+func (hc *HealthCheck) awaitProbeHold() {
+	limit := time.NewTimer(roundHoldLimit)
+	defer limit.Stop()
+	for C.ProbeHolding(time.Now()) {
+		step := time.NewTimer(roundHoldStep)
+		select {
+		case <-step.C:
+		case <-limit.C:
+			step.Stop()
+			return
+		case <-hc.ctx.Done():
+			step.Stop()
+			return
+		}
+	}
+}
+
 func (hc *HealthCheck) runRound(all []C.Proxy) {
+	hc.awaitProbeHold()
 	proxies, head := C.ProbeFirstOrder(all)
 	id := utils.NewUUIDV4().String()
 	log.Debugln("Start New Health Checking {%s}", id)

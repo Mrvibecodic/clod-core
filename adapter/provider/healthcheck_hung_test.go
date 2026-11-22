@@ -48,7 +48,7 @@ func TestAProbeThatOutlivesItsDeadlineDoesNotHoldTheNode(t *testing.T) {
 	}()
 	select {
 	case <-round:
-	case <-time.After(probeHedgeDelay + timeout + probeAbandonGrace + 2*time.Second):
+	case <-time.After(roundHoldLimit + probeHedgeDelay + timeout + probeAbandonGrace + 2*time.Second):
 		t.Fatal("the round waited for a probe past its deadline")
 	}
 	if proxy.AliveForTestUrl(target.url()) {
@@ -77,9 +77,12 @@ func TestAProbeStuckUnderTheProbeHoldDoesNotMarkTheNodeDead(t *testing.T) {
 	t.Cleanup(hc.close)
 
 	// The network is switching: probes stuck on its old connections are no
-	// failure of the node.
+	// failure of the node. The hold outlasts the round's wait for its end.
 	C.SetProbeHoldUntil(time.Now().Add(time.Minute))
 	t.Cleanup(func() { C.SetProbeHoldUntil(time.Time{}) })
+	oldLimit := roundHoldLimit
+	roundHoldLimit = 300 * time.Millisecond
+	t.Cleanup(func() { roundHoldLimit = oldLimit })
 
 	round := make(chan struct{})
 	go func() {
@@ -88,7 +91,7 @@ func TestAProbeStuckUnderTheProbeHoldDoesNotMarkTheNodeDead(t *testing.T) {
 	}()
 	select {
 	case <-round:
-	case <-time.After(probeHedgeDelay + timeout + probeAbandonGrace + 2*time.Second):
+	case <-time.After(roundHoldLimit + probeHedgeDelay + timeout + probeAbandonGrace + 2*time.Second):
 		t.Fatal("the round waited for a probe past its deadline")
 	}
 	if !proxy.AliveForTestUrl(target.url()) {
