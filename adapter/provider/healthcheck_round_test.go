@@ -17,6 +17,8 @@ import (
 type deviceNet struct {
 	failing int32
 	dials   atomic.Int32
+	// down: connections hang while it is set.
+	down atomic.Bool
 }
 
 // netNode is a node reached over a deviceNet; a dead one never answers.
@@ -29,7 +31,7 @@ type netNode struct {
 
 func (n *netNode) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	n.dials.Add(1)
-	if n.dead || n.net.dials.Add(1) <= n.net.failing {
+	if n.dead || n.net.down.Load() || n.net.dials.Add(1) <= n.net.failing {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -126,22 +128,98 @@ func TestARoundThatHeardFromNoNodeTriesAgain(t *testing.T) {
 	}
 }
 
-// No node answered the round nor its retry: the network is down for good,
-// and the marks say so.
-func TestARoundThatHeardFromNoNodeTwiceMarksThemDead(t *testing.T) {
+// silenceLimit sets how long the rounds of the test may hear from no node
+// before they record it.
+func silenceLimit(t *testing.T, limit time.Duration) {
+	old := roundSilenceLimit
+	roundSilenceLimit = limit
+	t.Cleanup(func() { roundSilenceLimit = old })
+}
+
+// No node answered the round nor its retry: the network of the device is
+// still down, and an outage of it marks no node dead.
+func TestARoundThatHeardFromNoNodeTwiceKeepsTheMarks(t *testing.T) {
 	const count = 4
 	net := &deviceNet{failing: 4 * count}
 	nodes, proxies, url := roundOf(t, net, count)
 	runRoundOf(t, proxies, url)
 	for i, p := range proxies {
+		if !p.AliveForTestUrl(url) {
+			t.Fatalf("node %d was marked dead by an outage of the device's network: %v", i, delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(url)))
+		}
+		if history := delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(url)); len(history) != 0 {
+			t.Fatalf("node %d: nothing heard, nothing recorded: %v", i, history)
+		}
+		if got := nodes[i].dials.Load(); got != 4 {
+			t.Fatalf("node %d got %d tries, want two in the round and two at the retry", i, got)
+		}
+	}
+}
+
+// The nodes have been silent past the limit: the network cuts them off for
+// good, and the marks say so.
+func TestNodesSilentPastTheLimitAreMarkedDead(t *testing.T) {
+	const count = 4
+	silenceLimit(t, 0)
+	net := &deviceNet{failing: 4 * count}
+	_, proxies, url := roundOf(t, net, count)
+	runRoundOf(t, proxies, url)
+	for i, p := range proxies {
 		if p.AliveForTestUrl(url) {
-			t.Fatalf("node %d answered neither the round nor its retry and stays alive", i)
+			t.Fatalf("node %d answered neither the round nor its retry past the limit and stays alive", i)
 		}
 		if history := delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(url)); len(history) != 1 {
 			t.Fatalf("node %d: one outage, one failure in the history: %v", i, history)
 		}
-		if got := nodes[i].dials.Load(); got != 4 {
-			t.Fatalf("node %d got %d tries, want two in the round and two at the retry", i, got)
+	}
+}
+
+// The silence is counted from the first round that heard from no node, over
+// the rounds after it, and a round that hears from one starts it over.
+func TestSilentRoundsCountFromTheFirstAndAnAnswerRestartsTheCount(t *testing.T) {
+	silenceLimit(t, 5*time.Second)
+	net := &deviceNet{}
+	net.down.Store(true)
+	_, proxies, url := roundOf(t, net, 3)
+	hc := NewHealthCheck(proxies, url, roundTestTimeout, 0, false, nil)
+	t.Cleanup(hc.close)
+	alive := func(want bool, when string) {
+		t.Helper()
+		for i, p := range proxies {
+			if p.AliveForTestUrl(url) != want {
+				t.Fatalf("%s: node %d alive %t, want %t: %v", when, i, !want, want, delays(p.(*adapter.Proxy).DelayHistoryForTestUrl(url)))
+			}
+		}
+	}
+
+	hc.check()
+	alive(true, "first silent round")
+	time.Sleep(roundSilenceLimit)
+	hc.check()
+	alive(false, "silent past the limit since the first silent round")
+
+	net.down.Store(false)
+	time.Sleep(1100 * time.Millisecond)
+	hc.check()
+	alive(true, "the network is back")
+
+	net.down.Store(true)
+	time.Sleep(1100 * time.Millisecond)
+	hc.check()
+	alive(true, "the silence starts over after an answer")
+}
+
+// A node that is down while the others answer is marked dead as before: the
+// silence of the device's network is about rounds where no node answers.
+func TestADeadNodeAmongAnsweringOnesIsMarkedDead(t *testing.T) {
+	_, proxies, url := roundOf(t, &deviceNet{}, 4, 0)
+	runRoundOf(t, proxies, url)
+	if proxies[0].AliveForTestUrl(url) {
+		t.Fatal("a node down while the others answer stays alive")
+	}
+	for i := 1; i < 4; i++ {
+		if !proxies[i].AliveForTestUrl(url) {
+			t.Fatalf("node %d answered and is marked dead", i)
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -45,6 +46,10 @@ type HealthCheck struct {
 	expectedStatus utils.IntRanges[uint16]
 	lastTouch      atomic.TypedValue[time.Time]
 	timeout        time.Duration
+	// silentSince is when rounds began hearing from no node, zero while
+	// the last round heard from one; only the running round reads and
+	// writes it.
+	silentSince time.Time
 }
 
 func (hc *HealthCheck) process() {
@@ -205,6 +210,9 @@ func (hc *HealthCheck) runRound(all []C.Proxy) {
 			stalls, tally.total.Load(), tally.recovered.Load(), tally.stalled.Load())
 	}
 	hc.lookAgain(proxies, tally)
+	if tally.answered.Load() > 0 {
+		hc.silentSince = time.Time{}
+	}
 	tally.reportDown(len(proxies))
 	log.Debugln("Finish A Health Checking {%s}", id)
 }
@@ -308,6 +316,13 @@ func (hc *HealthCheck) checkOne(p C.Proxy, url, uid string, expectedStatus utils
 // then, one that is gone is still gone.
 var roundRetryDelay = 30 * time.Second
 
+// roundSilenceLimit is how long rounds may hear from no node, their retries
+// included, before what they find is recorded: an outage of the device's
+// network (a phone waking up on a weak mobile network) lasts minutes, and
+// marking every node dead for it is false; a network that cuts the nodes off
+// for longer does make them unreachable.
+var roundSilenceLimit = 10 * time.Minute
+
 // heldNode is a live node whose probe failed in a round, with what the probe
 // would have written to it.
 type heldNode struct {
@@ -324,15 +339,17 @@ type heldNode struct {
 // of the round answered, the network was there: each of them is probed once
 // more, a whole probe over a new connection, and only that probe is recorded.
 // If none did and there were two or more, it is the network of the device:
-// nothing is recorded, they are probed again after roundRetryDelay, and what
-// that finds is recorded as it is, a long outage too. A round of one node
+// nothing is recorded, they are probed again after roundRetryDelay. If one
+// answers then, what the retry found is recorded; if none does, nothing is,
+// until the nodes have been silent for roundSilenceLimit. A round of one node
 // says nothing about the network: its result stands.
 func (hc *HealthCheck) lookAgain(order []C.Proxy, tally *probeTally) {
 	held := tally.held
 	if len(held) == 0 {
 		return
 	}
-	if tally.answered.Load() == 0 {
+	silent := tally.answered.Load() == 0
+	if silent {
 		if len(tally.probed) < 2 {
 			for _, node := range held {
 				node.hold.replay(node.url)
@@ -341,6 +358,9 @@ func (hc *HealthCheck) lookAgain(order []C.Proxy, tally *probeTally) {
 				}
 			}
 			return
+		}
+		if hc.silentSince.IsZero() {
+			hc.silentSince = time.Now()
 		}
 		log.Warnln("[Проба] плановая проверка: не ответил ни один узел — похоже, нет сети, проверка повторится")
 		if hc.listReplaced() {
@@ -360,27 +380,72 @@ func (hc *HealthCheck) lookAgain(order []C.Proxy, tally *probeTally) {
 		rank[p] = i
 	}
 	sort.SliceStable(held, func(i, j int) bool { return rank[held[i].p] < rank[held[j].p] })
+	type retried struct {
+		node    heldNode
+		hold    *heldProbe
+		outcome probeOutcome
+		result  *C.ProbeResult
+	}
+	tries := make([]retried, len(held))
 	b := new(errgroup.Group)
 	b.SetLimit(10)
-	for _, node := range held {
-		node := node
+	for i, node := range held {
+		i, node := i, node
 		b.Go(func() error {
+			try := retried{node: node, outcome: probeCancelled}
+			defer func() { tries[i] = try }()
 			if hc.listReplaced() {
 				return nil
 			}
-			outcome, result := hc.probeWith(node.p, node.url, node.expectedStatus, probeHow{fresh: true})
-			if outcome == probeCancelled {
-				return nil
+			how := probeHow{fresh: true}
+			if silent {
+				// What the retry of a silent round finds waits until it is
+				// known whether any node answered it.
+				try.hold = &heldProbe{}
+				how.hold = try.hold
 			}
-			if node.p.AliveForTestUrl(node.url) {
-				log.Debugln("[Проба] %s: в проверке не ответил, при повторном заходе ответил: %s", node.p.Name(), probeReason(result))
-			} else {
-				tally.noteDown(node.p.Name(), result)
-			}
+			try.outcome, try.result = hc.probeWith(node.p, node.url, node.expectedStatus, how)
 			return nil
 		})
 	}
 	_ = b.Wait()
+	if silent {
+		heard := false
+		for _, try := range tries {
+			if try.outcome != probeCancelled && farSideAnswered(try.result) {
+				heard = true
+				break
+			}
+		}
+		if heard {
+			tally.answered.Add(1)
+		} else if silence := time.Since(hc.silentSince); silence < roundSilenceLimit {
+			log.Warnln("[Проба] плановая проверка: при повторе тоже не ответил ни один узел — похоже, нет сети, пометки не меняются")
+			return
+		} else {
+			log.Warnln("[Проба] плановая проверка: ни один узел не отвечает %s подряд — пометки записываются", silence.Round(time.Second))
+		}
+	}
+	for _, try := range tries {
+		if try.outcome == probeCancelled {
+			continue
+		}
+		if try.hold != nil {
+			try.hold.replay(try.node.url)
+		}
+		if try.node.p.AliveForTestUrl(try.node.url) {
+			log.Debugln("[Проба] %s: в проверке не ответил, при повторном заходе ответил: %s", try.node.p.Name(), probeReason(try.result))
+		} else {
+			tally.noteDown(try.node.p.Name(), try.result)
+		}
+	}
+}
+
+// farSideAnswered reports whether a probe got an answer from the other side
+// of the network, a failed one too: a refused connection or a status code
+// shows the device's network works, a timeout does not.
+func farSideAnswered(r *C.ProbeResult) bool {
+	return r != nil && r.Held && (r.OK() || r.Stage == C.ProbeStageStatus || N.IsConnRefused(r.Err))
 }
 
 // heldProbe keeps what a probe writes to a node, for the round to write once
